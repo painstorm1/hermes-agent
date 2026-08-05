@@ -1263,9 +1263,10 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_mode_task = None
 
         client = getattr(handler, "client", None)
-        await _cancel_socket_tasks(
-            [task] + [getattr(client, attr, None) for attr in _SOCKET_CLIENT_TASK_ATTRS]
-        )
+        tasks = [task] + [
+            getattr(client, attr, None) for attr in _SOCKET_CLIENT_TASK_ATTRS
+        ]
+        await _cancel_socket_tasks(tasks)
 
         if handler is not None:
             try:
@@ -1276,6 +1277,15 @@ class SlackAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
+
+        # An in-flight aiohttp connect can turn the first CancelledError into an
+        # ordinary connector error. slack_sdk catches that and resumes its
+        # unconditional retry loop, now against the closed session. Cancel the
+        # retained tasks again after close, plus any client tasks rebound while
+        # the first cancellation was in flight, so that loop cannot escape.
+        await _cancel_socket_tasks(
+            tasks + [getattr(client, attr, None) for attr in _SOCKET_CLIENT_TASK_ATTRS]
+        )
 
     async def _socket_transport_connected(self) -> Optional[bool]:
         """Best-effort check of current Socket Mode transport state."""
