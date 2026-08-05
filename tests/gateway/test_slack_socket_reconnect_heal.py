@@ -75,11 +75,21 @@ class _FakeSession:
     def __init__(self, client=None) -> None:
         self.closed = False
         self.reachable = False
+        self.convert_next_cancel = False
         self.ws_connect_after_close = 0
         self._client = client
         self.live_tasks_at_close: list = []
 
     async def ws_connect(self):
+        if self.convert_next_cancel:
+            self.convert_next_cancel = False
+            try:
+                await asyncio.sleep(float("inf"))
+            except asyncio.CancelledError:
+                # aiohttp can turn cancellation of an in-flight connect into
+                # the ordinary "Connector is closed" exception seen in the
+                # incident. slack_sdk catches it and keeps retrying.
+                raise RuntimeError("Connector is closed")
         if self.closed:
             # This is the exact failure recorded in #46990.
             self.ws_connect_after_close += 1
@@ -231,6 +241,29 @@ class TestSocketModeTeardown:
             f"{session.ws_connect_after_close} time(s) after close_async()"
         )
         assert task.done(), "the old socket task outlived teardown"
+
+    @pytest.mark.asyncio
+    async def test_teardown_recancels_connect_after_session_close(self, adapter):
+        """A swallowed first cancellation must not become a closed-session loop."""
+        handler = _FakeHandler()
+        session = handler.client.aiohttp_client_session
+        session.convert_next_cancel = True
+        task = _attach(adapter, handler)
+        await asyncio.sleep(0.01)
+
+        try:
+            with patch.object(_slack_mod, "_SOCKET_TASK_CANCEL_TIMEOUT_S", 0.01):
+                await adapter._stop_socket_mode_handler()
+            await asyncio.sleep(0.02)
+
+            assert task.done(), (
+                "the connect task swallowed the pre-close cancellation and "
+                "kept retrying against the closed session"
+            )
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
 
     @pytest.mark.asyncio
