@@ -7201,6 +7201,9 @@ def refresh_agent_mcp_tools(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=quiet_mode,
+            skip_tool_search_assembly=bool(
+                getattr(agent, "skip_tool_search_assembly", False)
+            ),
         )
         or []
     )

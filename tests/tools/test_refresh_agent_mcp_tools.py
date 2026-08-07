@@ -44,6 +44,25 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert len(agent.tools) == 3
 
 
+def test_refresh_preserves_direct_tool_assembly(monkeypatch):
+    """A restricted direct-tool route must not regain the Tool Search bridge."""
+    agent = _agent(["luna_web_search", "luna_fnos_summary"])
+    agent.skip_tool_search_assembly = True
+    captured = {}
+
+    import model_tools
+
+    def _get_tool_definitions(**kwargs):
+        captured.update(kwargs)
+        return list(agent.tools)
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _get_tool_definitions)
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert captured["skip_tool_search_assembly"] is True
+
+
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
     """B1 regression: a rebuild must NOT drop post-build-injected tools.
 

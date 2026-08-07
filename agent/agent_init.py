@@ -532,6 +532,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    skip_tool_search_assembly: bool = False,
 ):
     """
     Initialize the AI Agent.
@@ -852,6 +853,7 @@ def init_agent(
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
+    agent.skip_tool_search_assembly = bool(skip_tool_search_assembly)
     
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
@@ -1453,6 +1455,7 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        skip_tool_search_assembly=agent.skip_tool_search_assembly,
     )
     
     # Show tool configuration and store valid tool names for validation
