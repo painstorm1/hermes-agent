@@ -2277,6 +2277,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 for key in allowed_keys
                 if cfg.get(key) is not None and str(cfg[key]).strip()
             }
+            raw_toolsets = cfg.get("toolsets")
+            if isinstance(raw_toolsets, (list, tuple, set)):
+                route["toolsets"] = [
+                    value.strip()
+                    for value in raw_toolsets
+                    if isinstance(value, str) and value.strip()
+                ]
+            raw_limit_message = cfg.get("tool_limit_message")
+            if isinstance(raw_limit_message, str) and raw_limit_message.strip():
+                route["tool_limit_message"] = raw_limit_message.strip()
+            try:
+                max_tool_calls = int(cfg.get("max_tool_calls", 0))
+            except (TypeError, ValueError):
+                max_tool_calls = 0
+            if max_tool_calls > 0:
+                route["max_tool_calls"] = max_tool_calls
             if not route.get("model"):
                 logger.warning(
                     "api_server model_routes: route %r has no 'model'; dropping", alias_str
@@ -2865,7 +2881,12 @@ class APIServerAdapter(BasePlatformAdapter):
             self._last_resolved_model["*"] = model
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        platform_toolsets = set(_get_platform_tools(user_config, "api_server"))
+        route_toolsets = route.get("toolsets") if isinstance(route, dict) else None
+        if isinstance(route_toolsets, list):
+            enabled_toolsets = sorted(platform_toolsets.intersection(route_toolsets))
+        else:
+            enabled_toolsets = sorted(platform_toolsets)
 
         max_iterations = _current_max_iterations()
 
@@ -2901,6 +2922,24 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        route_tool_cap = route.get("max_tool_calls") if isinstance(route, dict) else None
+        if isinstance(route_tool_cap, int) and route_tool_cap > 0:
+            from dataclasses import replace
+            from agent.tool_guardrails import ToolCallGuardrailController
+
+            guardrail_config = agent._tool_guardrails.config
+            agent._tool_guardrails = ToolCallGuardrailController(
+                replace(
+                    guardrail_config,
+                    loop_caps=replace(
+                        guardrail_config.loop_caps,
+                        max_total_tools=route_tool_cap,
+                    ),
+                )
+            )
+        agent._route_tool_limit_message = (
+            route.get("tool_limit_message", "") if isinstance(route, dict) else ""
+        )
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,

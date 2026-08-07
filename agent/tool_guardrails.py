@@ -156,6 +156,7 @@ class LoopCapConfig:
 
     max_web_searches: int = _DEFAULT_MAX_WEB_SEARCHES_PER_TURN
     max_subagents: int = _DEFAULT_MAX_SUBAGENTS_PER_TURN
+    max_total_tools: int = 0
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "LoopCapConfig":
@@ -169,6 +170,9 @@ class LoopCapConfig:
             ),
             max_subagents=_non_negative_int(
                 data.get("max_subagents"), defaults.max_subagents
+            ),
+            max_total_tools=_non_negative_int(
+                data.get("max_total_tools"), defaults.max_total_tools
             ),
         )
 
@@ -287,6 +291,7 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._turn_total_tool_count = 0
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -458,6 +463,24 @@ class ToolCallGuardrailController:
         turn via ``reset_for_turn``.
         """
         caps = self.config.loop_caps
+
+        total_cap = caps.max_total_tools
+        if total_cap and self._turn_total_tool_count >= total_cap:
+            decision = ToolGuardrailDecision(
+                action="block",
+                code="loop_total_tool_cap",
+                message=(
+                    f"Blocked {tool_name}: this turn has already made {total_cap} "
+                    "tool calls, the per-turn limit. Finish with the results "
+                    "already collected."
+                ),
+                tool_name=tool_name,
+                count=self._turn_total_tool_count,
+                signature=signature,
+            )
+            self._halt_decision = decision
+            return decision
+        self._turn_total_tool_count += 1
 
         if tool_name == "web_search":
             cap = caps.max_web_searches

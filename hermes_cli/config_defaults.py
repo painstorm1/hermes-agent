@@ -560,6 +560,7 @@ DEFAULT_CONFIG = {
         "loop_caps": {
             "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
             "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
+            "max_total_tools": 0,     # max all tool calls per turn (0 = unlimited)
         },
     },
 

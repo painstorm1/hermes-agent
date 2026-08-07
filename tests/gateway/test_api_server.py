@@ -2477,6 +2477,24 @@ class TestModelRoutesParsing:
         adapter = _make_routing_adapter(routes)
         assert adapter._model_routes == routes
 
+    def test_route_tool_policy_is_normalized(self):
+        adapter = _make_routing_adapter(
+            {
+                "luna": {
+                    "model": "openai/gpt-5",
+                    "toolsets": ["luna_web", "luna_fnos", "", 42],
+                    "max_tool_calls": "5",
+                    "tool_limit_message": " ask fn_cool ",
+                }
+            }
+        )
+        assert adapter._model_routes["luna"] == {
+            "model": "openai/gpt-5",
+            "toolsets": ["luna_web", "luna_fnos"],
+            "max_tool_calls": 5,
+            "tool_limit_message": "ask fn_cool",
+        }
+
 
     def test_route_without_model_is_dropped(self):
         adapter = _make_routing_adapter({"bad": {"provider": "openrouter"}})
@@ -2553,6 +2571,43 @@ class TestModelRoutesAgentCreation:
         assert captured["model"] == "other/model"
         assert captured["provider"] == "otherprov"
         assert captured["api_key"] == "sk-otherprov"
+
+    def test_route_limits_tools_to_platform_intersection_and_caps_calls(self, monkeypatch):
+        from agent.tool_guardrails import ToolCallGuardrailController
+
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self._tool_guardrails = ToolCallGuardrailController()
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools",
+            lambda *_: {"file", "luna_web", "luna_fnos"},
+        )
+        adapter = _make_routing_adapter(
+            {
+                "luna": {
+                    "model": "openai/gpt-5",
+                    "toolsets": ["luna_web", "luna_fnos", "terminal"],
+                    "max_tool_calls": 5,
+                    "tool_limit_message": "ask fn_cool",
+                }
+            }
+        )
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        agent = adapter._create_agent(session_id="s1", route=adapter._resolve_route("luna"))
+
+        assert captured["enabled_toolsets"] == ["luna_fnos", "luna_web"]
+        for i in range(5):
+            assert agent._tool_guardrails.before_call(f"tool_{i}", {"i": i}).action == "allow"
+        decision = agent._tool_guardrails.before_call("tool_5", {"i": 5})
+        assert decision.code == "loop_total_tool_cap"
+        assert agent._route_tool_limit_message == "ask fn_cool"
 
 
     def test_session_model_override_beats_route(self, monkeypatch):

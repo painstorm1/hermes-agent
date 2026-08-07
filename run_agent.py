@@ -7595,6 +7595,10 @@ class AIAgent:
             self._tool_guardrail_halt_decision = decision
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
+        if decision.code == "loop_total_tool_cap":
+            route_message = getattr(self, "_route_tool_limit_message", "")
+            if route_message:
+                return route_message
         tool = decision.tool_name or "a tool"
         return (
             f"I stopped retrying {tool} because it hit the tool-call guardrail "
