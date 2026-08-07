@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -279,6 +280,7 @@ class ToolCallGuardrailController:
 
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
+        self._loop_cap_lock = threading.Lock()
         self.reset_for_turn()
 
     def reset_for_turn(self) -> None:
@@ -465,22 +467,23 @@ class ToolCallGuardrailController:
         caps = self.config.loop_caps
 
         total_cap = caps.max_total_tools
-        if total_cap and self._turn_total_tool_count >= total_cap:
-            decision = ToolGuardrailDecision(
-                action="block",
-                code="loop_total_tool_cap",
-                message=(
-                    f"Blocked {tool_name}: this turn has already made {total_cap} "
-                    "tool calls, the per-turn limit. Finish with the results "
-                    "already collected."
-                ),
-                tool_name=tool_name,
-                count=self._turn_total_tool_count,
-                signature=signature,
-            )
-            self._halt_decision = decision
-            return decision
-        self._turn_total_tool_count += 1
+        with self._loop_cap_lock:
+            if total_cap and self._turn_total_tool_count >= total_cap:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="loop_total_tool_cap",
+                    message=(
+                        f"Blocked {tool_name}: this turn has already made {total_cap} "
+                        "tool calls, the per-turn limit. Finish with the results "
+                        "already collected."
+                    ),
+                    tool_name=tool_name,
+                    count=self._turn_total_tool_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+            self._turn_total_tool_count += 1
 
         if tool_name == "web_search":
             cap = caps.max_web_searches

@@ -31,6 +31,8 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
     _IdempotencyCache,
+    _MAX_MODEL_ROUTE_TOOL_CALLS,
+    _MAX_MODEL_ROUTE_TOOL_LIMIT_MESSAGE_LEN,
     _derive_chat_session_id,
     _hermes_version,
     _redact_api_error_text,
@@ -2483,7 +2485,8 @@ class TestModelRoutesParsing:
                 "luna": {
                     "model": "openai/gpt-5",
                     "toolsets": ["luna_web", "luna_fnos", "", 42],
-                    "max_tool_calls": "5",
+                    "tool_search": False,
+                    "max_tool_calls": 5,
                     "tool_limit_message": " ask fn_cool ",
                 }
             }
@@ -2491,9 +2494,55 @@ class TestModelRoutesParsing:
         assert adapter._model_routes["luna"] == {
             "model": "openai/gpt-5",
             "toolsets": ["luna_web", "luna_fnos"],
+            "tool_search": False,
             "max_tool_calls": 5,
             "tool_limit_message": "ask fn_cool",
         }
+
+    @pytest.mark.parametrize(
+        "value",
+        [0, False, True, "5", _MAX_MODEL_ROUTE_TOOL_CALLS + 1],
+    )
+    def test_invalid_explicit_route_tool_cap_disables_route_tools(self, value):
+        adapter = _make_routing_adapter(
+            {
+                "luna": {
+                    "model": "openai/gpt-5",
+                    "toolsets": ["luna_web", "luna_fnos"],
+                    "max_tool_calls": value,
+                }
+            }
+        )
+
+        route = adapter._model_routes["luna"]
+        assert route["toolsets"] == []
+        assert "max_tool_calls" not in route
+
+    def test_route_tool_limit_message_is_one_bounded_control_free_line(self):
+        adapter = _make_routing_adapter(
+            {
+                "luna": {
+                    "model": "openai/gpt-5",
+                    "tool_limit_message": (
+                        " ask\nfn\tcool\x00" + chr(13) + chr(0x202E) + " "
+                        + "x" * _MAX_MODEL_ROUTE_TOOL_LIMIT_MESSAGE_LEN
+                    ),
+                }
+            }
+        )
+
+        message = adapter._model_routes["luna"]["tool_limit_message"]
+        assert message.startswith("ask fn cool ")
+        assert len(message) == _MAX_MODEL_ROUTE_TOOL_LIMIT_MESSAGE_LEN
+        assert all(character.isprintable() for character in message)
+        assert message == " ".join(message.split())
+
+    @pytest.mark.parametrize("value", [None, 0, 1, "false", [], {}])
+    def test_route_tool_search_ignores_non_boolean_values(self, value):
+        adapter = _make_routing_adapter(
+            {"luna": {"model": "openai/gpt-5", "tool_search": value}}
+        )
+        assert "tool_search" not in adapter._model_routes["luna"]
 
 
     def test_route_without_model_is_dropped(self):
@@ -2592,6 +2641,7 @@ class TestModelRoutesAgentCreation:
                 "luna": {
                     "model": "openai/gpt-5",
                     "toolsets": ["luna_web", "luna_fnos", "terminal"],
+                    "tool_search": False,
                     "max_tool_calls": 5,
                     "tool_limit_message": "ask fn_cool",
                 }
@@ -2603,6 +2653,7 @@ class TestModelRoutesAgentCreation:
         agent = adapter._create_agent(session_id="s1", route=adapter._resolve_route("luna"))
 
         assert captured["enabled_toolsets"] == ["luna_fnos", "luna_web"]
+        assert captured["skip_tool_search_assembly"] is True
         for i in range(5):
             assert agent._tool_guardrails.before_call(f"tool_{i}", {"i": i}).action == "allow"
         decision = agent._tool_guardrails.before_call("tool_5", {"i": 5})

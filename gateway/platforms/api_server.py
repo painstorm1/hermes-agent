@@ -155,6 +155,9 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
+# Route-local caps are for narrow assistants, not the unrestricted global loop.
+_MAX_MODEL_ROUTE_TOOL_CALLS = 100
+_MAX_MODEL_ROUTE_TOOL_LIMIT_MESSAGE_LEN = 500
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
 
@@ -2244,9 +2247,9 @@ class APIServerAdapter(BasePlatformAdapter):
     def _parse_model_routes(raw: Any) -> Dict[str, Dict[str, Any]]:
         """Validate and normalize the ``model_routes`` config block.
 
-        Accepts a mapping of ``alias -> {model, provider?, api_key?, base_url?}``.
-        Invalid shapes are dropped (never raised) so a config typo can't take
-        the whole API server down.  Route values are coerced to strings.
+        Accepts model/provider settings plus an optional route-local toolset,
+        tool-call cap, and controlled limit message. Invalid route shapes are
+        dropped; an invalid explicit cap keeps the route but disables its tools.
 
         Security: per-route ``api_key`` values are UPSTREAM provider
         credentials (used to call the routed model's backend), not caller
@@ -2284,15 +2287,32 @@ class APIServerAdapter(BasePlatformAdapter):
                     for value in raw_toolsets
                     if isinstance(value, str) and value.strip()
                 ]
+            if type(cfg.get("tool_search")) is bool:
+                route["tool_search"] = cfg["tool_search"]
             raw_limit_message = cfg.get("tool_limit_message")
             if isinstance(raw_limit_message, str) and raw_limit_message.strip():
-                route["tool_limit_message"] = raw_limit_message.strip()
-            try:
-                max_tool_calls = int(cfg.get("max_tool_calls", 0))
-            except (TypeError, ValueError):
-                max_tool_calls = 0
-            if max_tool_calls > 0:
-                route["max_tool_calls"] = max_tool_calls
+                limit_message = " ".join(
+                    "".join(
+                        character if character.isprintable() else " "
+                        for character in raw_limit_message
+                    ).split()
+                )[:_MAX_MODEL_ROUTE_TOOL_LIMIT_MESSAGE_LEN].strip()
+                if limit_message:
+                    route["tool_limit_message"] = limit_message
+            if "max_tool_calls" in cfg:
+                max_tool_calls = cfg.get("max_tool_calls")
+                if (
+                    type(max_tool_calls) is int
+                    and 1 <= max_tool_calls <= _MAX_MODEL_ROUTE_TOOL_CALLS
+                ):
+                    route["max_tool_calls"] = max_tool_calls
+                else:
+                    route["toolsets"] = []
+                    logger.warning(
+                        "api_server model_routes: route %r has invalid max_tool_calls; "
+                        "disabling route tools",
+                        alias_str,
+                    )
             if not route.get("model"):
                 logger.warning(
                     "api_server model_routes: route %r has no 'model'; dropping", alias_str
@@ -2907,6 +2927,9 @@ class APIServerAdapter(BasePlatformAdapter):
             "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
             "enabled_toolsets": enabled_toolsets,
+            "skip_tool_search_assembly": (
+                isinstance(route, dict) and route.get("tool_search") is False
+            ),
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
