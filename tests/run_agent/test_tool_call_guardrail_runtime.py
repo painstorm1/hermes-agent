@@ -373,6 +373,21 @@ def test_default_run_conversation_warns_without_guardrail_halt():
 
 
 
+def test_total_cap_uses_route_specific_user_message_when_present():
+    from agent.tool_guardrails import ToolGuardrailDecision
+
+    agent = object.__new__(AIAgent)
+    agent._route_tool_limit_message = "ask fn_cool"
+    decision = ToolGuardrailDecision(
+        action="block",
+        code="loop_total_tool_cap",
+        tool_name="luna_web_search",
+        count=5,
+    )
+
+    assert agent._toolguard_controlled_halt_response(decision) == "ask fn_cool"
+
+
 def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     """Regression for #30770: when the guardrail halts the loop, the
     synthesized halt message must be pushed through ``stream_delta_callback``

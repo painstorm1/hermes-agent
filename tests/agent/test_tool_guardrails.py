@@ -169,6 +169,26 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.should_halt is True
 
 
+def test_total_tool_cap_allows_five_and_blocks_sixth_distinct_call():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_total_tools=5))
+    )
+    for i in range(5):
+        assert controller.before_call(f"tool_{i}", {"i": i}).action == "allow"
+    decision = controller.before_call("tool_5", {"i": 5})
+    assert decision.action == "block"
+    assert decision.code == "loop_total_tool_cap"
+    assert decision.count == 5
+
+
+def test_total_tool_cap_zero_is_unlimited():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_total_tools=0))
+    )
+    for i in range(100):
+        assert controller.before_call(f"tool_{i}", {"i": i}).action == "allow"
+
+
 
 
 
