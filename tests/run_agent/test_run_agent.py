@@ -3011,6 +3011,54 @@ class TestRunConversation:
         assert result is failed_result
         assert order == ["logical", "metrics"]
 
+    def test_certified_iteration_limit_runs_one_hidden_completion_turn(self, agent):
+        first_summary = """Iteration limit.
+[HERMES_COMPLETION_RESERVE_V1]
+eligible: true
+task_id: task-1
+root_cause: Verified root cause.
+ticket_scope: Fixed ticket and completion condition.
+verified_work: Focused tests and build passed.
+remaining_steps: Commit and fresh readback only.
+approval_basis: not_required
+[/HERMES_COMPLETION_RESERVE_V1]
+"""
+        first_result = {
+            "final_response": first_summary,
+            "messages": [{"role": "assistant", "content": first_summary}],
+            "api_calls": 60,
+            "completed": False,
+            "failed": False,
+            "interrupted": False,
+            "turn_exit_reason": "max_iterations_reached(60/60)",
+        }
+        second_result = {
+            "final_response": "completed",
+            "messages": [{"role": "assistant", "content": "completed"}],
+            "api_calls": 3,
+            "completed": True,
+            "failed": False,
+            "interrupted": False,
+            "turn_exit_reason": "text_response(finish_reason=stop)",
+        }
+        agent._completion_reserve_turns = 7
+
+        with patch(
+            "agent.conversation_loop.run_conversation",
+            side_effect=[first_result, second_result],
+        ) as raw_run:
+            result = agent.run_conversation("private prompt", task_id="task-1")
+
+        assert result is second_result
+        assert raw_run.call_count == 2
+        first_call, second_call = raw_run.call_args_list
+        assert "HERMES_COMPLETION_RESERVE_V1" in first_call.args[1]
+        assert first_call.args[6] == "private prompt"
+        assert second_call.args[3] == first_result["messages"]
+        assert second_call.kwargs["persist_user_display_kind"] == "auto_continue"
+        assert agent.max_iterations == 90
+        assert result["_completion_reserve"]["completed"] is True
+
     def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
         payload_built = False
         hook_called = False

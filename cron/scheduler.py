@@ -3777,6 +3777,9 @@ def run_job(
 
         # Max iterations
         max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        from agent.completion_reserve import turns_for_cron_job
+
+        completion_reserve_turns = turns_for_cron_job(_cfg, job_id)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -4092,6 +4095,8 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        # Override the platform-wide default with the exact cron-job allowlist.
+        agent._completion_reserve_turns = completion_reserve_turns
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -4232,6 +4237,17 @@ def run_job(
         # builds the proper failure tuple. (issue #17855)
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
+        completion_reserve = result.get("_completion_reserve")
+        if (
+            isinstance(completion_reserve, dict)
+            and result.get("completed") is not True
+        ):
+            reason = completion_reserve.get("reason") or "incomplete"
+            detail = result.get("error") or final_response_text
+            raise RuntimeError(
+                f"completion reserve unresolved ({reason})"
+                + (f": {detail}" if detail else "")
+            )
         max_iteration_summary = (
             result.get("failed") is not True
             and result.get("completed") is False
