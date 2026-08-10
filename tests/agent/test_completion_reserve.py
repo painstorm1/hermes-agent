@@ -83,6 +83,31 @@ def test_cron_config_requires_exact_job_id():
     assert turns_for_cron_job(cfg, "other") == 0
 
 
+def test_config_set_json_string_lists_are_strictly_supported():
+    cfg = {
+        "agent": {
+            "completion_reserve": {
+                "enabled": True,
+                "platforms": '["telegram","slack"]',
+                "max_turns": 60,
+            }
+        },
+        "cron": {
+            "completion_reserve": {
+                "enabled": True,
+                "job_ids": '["job-1"]',
+                "max_turns": 60,
+            }
+        },
+    }
+    assert turns_for_platform(cfg, "telegram") == 60
+    assert turns_for_cron_job(cfg, "job-1") == 60
+
+    for malformed in ("telegram,slack", '{"telegram": true}', '["telegram",3]', '[""]'):
+        cfg["agent"]["completion_reserve"]["platforms"] = malformed
+        assert turns_for_platform(cfg, "telegram") == 0
+
+
 def test_certificate_requires_exact_task_and_every_evidence_field():
     assert certified_checkpoint(_certificate(), "task-1") is not None
     assert certified_checkpoint(_certificate("other"), "task-1") is None

@@ -7,6 +7,7 @@ recurse because callers invoke the raw conversation loop for the reserve.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable, Optional
 
 _BEGIN = "[HERMES_COMPLETION_RESERVE_V1]"
@@ -24,6 +25,20 @@ def _strict_turns(value: Any) -> int:
     return value if type(value) is int and 1 <= value <= 500 else 0
 
 
+def _strict_string_list(value: Any) -> list[str]:
+    """Accept a YAML list or the exact JSON list emitted by ``config set``."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(value, list):
+        return []
+    if any(not isinstance(item, str) or not item for item in value):
+        return []
+    return value
+
+
 def turns_for_platform(cfg: dict, platform: str) -> int:
     """Return reserve turns for an explicitly enabled top-level platform."""
     agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
@@ -32,8 +47,8 @@ def turns_for_platform(cfg: dict, platform: str) -> int:
     )
     if not isinstance(reserve, dict) or reserve.get("enabled") is not True:
         return 0
-    platforms = reserve.get("platforms")
-    if not isinstance(platforms, list) or platform not in platforms:
+    platforms = _strict_string_list(reserve.get("platforms"))
+    if platform not in platforms:
         return 0
     return _strict_turns(reserve.get("max_turns"))
 
@@ -44,8 +59,8 @@ def turns_for_cron_job(cfg: dict, job_id: str) -> int:
     reserve = cron_cfg.get("completion_reserve") if isinstance(cron_cfg, dict) else None
     if not isinstance(reserve, dict) or reserve.get("enabled") is not True:
         return 0
-    job_ids = reserve.get("job_ids")
-    if not isinstance(job_ids, list) or job_id not in job_ids:
+    job_ids = _strict_string_list(reserve.get("job_ids"))
+    if job_id not in job_ids:
         return 0
     return _strict_turns(reserve.get("max_turns"))
 
