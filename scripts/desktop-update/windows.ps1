@@ -545,6 +545,7 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     # unreliably $null under PS 5.1 even with the Handle-touch workaround.
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
+    $psi.WorkingDirectory = $InstallRoot
     # .Arguments string (PS 5.1 / .NET Framework has no ArgumentList).
     # Args here are fixed flags + a branch ref; quote each defensively.
     $psi.Arguments = ($HermesArgs | ForEach-Object { '"{0}"' -f ($_ -replace '"', '\"') }) -join ' '
@@ -723,7 +724,8 @@ try {
         Write-HandoffLog $finalMsg
         exit $finalCode
     }
-    $updateArgs = @("-m", "hermes_cli.main", "update", "--yes", "--gateway", "--force", "--branch", $Branch)
+    $moduleArgs = @("-m", "hermes_cli.main")
+    $updateArgs = $moduleArgs + @("update", "--yes", "--gateway", "--force", "--branch", $Branch)
     Write-HandoffLog ("running: python " + ($updateArgs -join " "))
     $res = Invoke-HermesStep $pythonExe $updateArgs "update"
     Write-HandoffLog "hermes update exit code: $($res.Code)"
@@ -736,17 +738,24 @@ try {
         Write-HandoffLog "retry exit code: $($res.Code)"
     }
 
-    # -- 4. Truthful completion: don't trust exit 0 -------------------------
-    # `hermes update` treats a Desktop GUI build failure as NON-fatal (prints
-    # a one-line warning, exits 0). For a Desktop-DRIVEN update that warning
-    # is fatal: we would relaunch the old exe and call it success. Detect it,
-    # retry the build once, and propagate honestly.
+    # -- 4. Truthful completion: validate the Desktop package ---------------
+    # `hermes update` may finish while a Desktop build has failed. Always
+    # build the package we are about to relaunch, then retry once if either
+    # that validation fails or its requested executable is still absent.
     $desktopBuildFailed = $false
-    if ($res.Code -eq 0 -and $res.Output -match "Desktop build failed") {
-        Write-HandoffLog "hermes update reported a desktop build failure (non-fatal there, fatal here); retrying build"
-        $rebuild = Invoke-HermesStep $pythonExe @("-m", "hermes_cli.main", "desktop", "--force-build", "--build-only") "rebuild"
-        Write-HandoffLog "desktop rebuild exit code: $($rebuild.Code)"
-        if ($rebuild.Code -ne 0) { $desktopBuildFailed = $true }
+    if ($res.Code -eq 0) {
+        $buildArgs = $moduleArgs + @("desktop", "--build-only")
+        $rebuild = Invoke-HermesStep $pythonExe $buildArgs "rebuild"
+        Write-HandoffLog "desktop validation build exit code: $($rebuild.Code)"
+        $relaunchMissing = $RelaunchExe -and -not (Test-Path -LiteralPath $RelaunchExe)
+        if ($rebuild.Code -ne 0 -or $relaunchMissing) {
+            Write-HandoffLog "desktop validation failed; retrying forced build"
+            $forceBuildArgs = $moduleArgs + @("desktop", "--force-build", "--build-only")
+            $rebuild = Invoke-HermesStep $pythonExe $forceBuildArgs "rebuild"
+            Write-HandoffLog "desktop forced rebuild exit code: $($rebuild.Code)"
+        }
+        $relaunchMissing = $RelaunchExe -and -not (Test-Path -LiteralPath $RelaunchExe)
+        $desktopBuildFailed = $rebuild.Code -ne 0 -or $relaunchMissing
     }
 
     if ($res.Code -eq 0 -and -not $desktopBuildFailed) {
