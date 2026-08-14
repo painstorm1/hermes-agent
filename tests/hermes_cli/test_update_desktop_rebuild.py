@@ -36,6 +36,24 @@ def test_never_installed_desktop_is_not_built(tmp_path, monkeypatch):
     run.assert_not_called()
 
 
+def test_installed_desktop_with_missing_package_cannot_be_rebuilt(tmp_path, monkeypatch):
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
+
+    assert update_cmd._maybe_rebuild_desktop(True) is False
+
+
+def test_installed_desktop_with_missing_managed_npm_cannot_be_rebuilt(
+    tmp_path, monkeypatch
+):
+    desktop = tmp_path / "apps/desktop"
+    desktop.mkdir(parents=True)
+    (desktop / "package.json").write_text("{}")
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(update_cmd._m(), "_resolve_node_runtime_npm", lambda: None)
+
+    assert update_cmd._maybe_rebuild_desktop(True) is False
+
+
 def test_rebuild_failure_is_reported_after_one_retry(tmp_path, monkeypatch):
     desktop = tmp_path / "apps/desktop"
     desktop.mkdir(parents=True)

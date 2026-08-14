@@ -955,11 +955,12 @@ def _maybe_rebuild_desktop(was_installed: bool) -> bool:
         return True
 
     desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
-    if not (
-        (desktop_dir / "package.json").exists()
-        and _m()._resolve_node_runtime_npm()
-    ):
-        return True
+    if not (desktop_dir / "package.json").exists():
+        print("  ⚠ Desktop build unavailable: updated source is missing apps/desktop/package.json")
+        return False
+    if not _m()._resolve_node_runtime_npm():
+        print("  ⚠ Desktop build unavailable: managed Node/npm runtime was not found")
+        return False
 
     print("→ Checking if desktop app needs rebuilding...")
     try:
