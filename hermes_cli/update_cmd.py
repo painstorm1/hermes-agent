@@ -61,6 +61,12 @@ _UPDATE_RUNTIME_RELOAD_MODULES = (
     "tools.lazy_deps",
 )
 
+_ZIP_PRESERVED_APPS_PATHS = (
+    Path("desktop") / "release",
+    Path("desktop") / "dist",
+)
+
+
 def _reload_updated_runtime_modules() -> None:
     """Reload update-sensitive modules after the checkout changes in-place.
 
@@ -720,7 +726,9 @@ def _atomic_replace_dir(src: str, dst: str) -> None:
     _commit_staged_replacements([(_stage_replacement(src, dst), dst)])
 
 
-def _stage_replacement(src: str, dst: str) -> str:
+def _stage_replacement(
+    src: str, dst: str, *, preserve_relative: tuple[Path, ...] = ()
+) -> str:
     """Copy *src* to a sibling staging path for *dst*; return the staging path.
 
     Phase 1 of the two-phase replace. Handles both directories and plain
@@ -746,7 +754,38 @@ def _stage_replacement(src: str, dst: str) -> str:
         shutil.copytree(src, staging)
     else:
         shutil.copy2(src, staging)
+    for relative in preserve_relative:
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"unsafe preserved path: {relative}")
+        existing = Path(dst) / relative
+        preserved = Path(staging) / relative
+        if existing.is_dir():
+            preserved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(existing, preserved)
+        elif existing.is_file():
+            preserved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(existing, preserved)
     return staging
+
+
+def _path_payload_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    if path.is_dir():
+        return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+    return 0
+
+
+def _zip_staging_size(
+    extracted_root: Path, entries: list[str], project_root: Path
+) -> int:
+    source_bytes = sum(_path_payload_size(extracted_root / entry) for entry in entries)
+    preserved_bytes = sum(
+        _path_payload_size(project_root / "apps" / relative)
+        for relative in _ZIP_PRESERVED_APPS_PATHS
+        if "apps" in entries
+    )
+    return source_bytes + preserved_bytes
 
 
 def _discard_staged(staged) -> None:
@@ -766,6 +805,29 @@ def _discard_staged(staged) -> None:
                 os.remove(staging)
         except OSError as exc:  # best-effort cleanup, never fatal
             logger.warning("could not remove staging path %s: %s", staging, exc)
+
+
+def _stage_zip_entries(
+    extracted_root: Path, project_root: Path, entries: list[str]
+) -> list[tuple[str, str]]:
+    staged = []
+    try:
+        for item in entries:
+            preserve = _ZIP_PRESERVED_APPS_PATHS if item == "apps" else ()
+            src = extracted_root / item
+            dst = project_root / item
+            staged.append(
+                (
+                    _stage_replacement(
+                        str(src), str(dst), preserve_relative=preserve
+                    ),
+                    str(dst),
+                )
+            )
+    except Exception:
+        _discard_staged(staged)
+        raise
+    return staged
 
 
 def _commit_staged_replacements(staged) -> None:
@@ -972,16 +1034,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
         #
         # Staging costs one extra copy of the tree on disk. Check up front so
         # we fail with a clear message instead of running out mid-copy.
-        need = sum(
-            os.path.getsize(os.path.join(dirpath, f))
-            for entry in entries
-            for dirpath, _dirs, files in os.walk(os.path.join(extracted, entry))
-            for f in files
-        ) + sum(
-            os.path.getsize(os.path.join(extracted, e))
-            for e in entries
-            if os.path.isfile(os.path.join(extracted, e))
-        )
+        need = _zip_staging_size(Path(extracted), entries, _m().PROJECT_ROOT)
         # Only the staging copy is new — the live tree already occupies its
         # space and the swaps are renames, not copies. Ask for the staging
         # copy plus 20% headroom rather than a full 2x, which would block
@@ -996,17 +1049,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
                 f"{free // (1024 * 1024)} MB)"
             )
 
-        staged: list[tuple[str, str]] = []
-        try:
-            for item in entries:
-                src = os.path.join(extracted, item)
-                dst = os.path.join(str(_m().PROJECT_ROOT), item)
-                staged.append((_stage_replacement(src, dst), dst))
-        except Exception:
-            # Nothing is live yet; drop the partial staging copies so a retry
-            # starts from the same free space this attempt did.
-            _discard_staged(staged)
-            raise
+        staged = _stage_zip_entries(Path(extracted), _m().PROJECT_ROOT, entries)
 
         try:
             _commit_staged_replacements(staged)

@@ -430,41 +430,69 @@ def test_commit_failure_plus_discard_leaves_no_staging_litter(tmp_path, monkeypa
     assert litter == [], f"orphaned update litter: {litter}"
 
 
-def test_update_via_zip_wires_discard_into_the_commit_failure_path():
-    """AST wiring contract: _update_via_zip must call _discard_staged from an
-    exception handler around _commit_staged_replacements. The behavioral test
-    above mirrors that wiring; this pins the production function itself so a
-    refactor can't silently drop the cleanup."""
-    import ast
-    import inspect
-    import textwrap
+def test_zip_apps_swap_preserves_only_desktop_artifacts(tmp_path):
+    """The ZIP apps swap retains only generated Desktop artifacts."""
+    live = tmp_path / "live"
+    extracted = tmp_path / "extracted"
+    (live / "apps/desktop/release/win-unpacked").mkdir(parents=True)
+    (live / "apps/desktop/release/win-unpacked/Hermes.exe").write_bytes(b"old-exe")
+    (live / "apps/desktop/dist").mkdir(parents=True)
+    (live / "apps/desktop/dist/index.html").write_text("old-dist")
+    (live / "apps/desktop/stale.ts").write_text("must disappear")
+    (live / "apps/desktop/arbitrary.cache").write_text("must disappear")
+    (extracted / "apps/desktop").mkdir(parents=True)
+    (extracted / "apps/desktop/main.ts").write_text("new source")
 
-    src = textwrap.dedent(inspect.getsource(update_cmd._update_via_zip))
-    tree = ast.parse(src)
+    staged = update_cmd._stage_zip_entries(extracted, live, ["apps"])
+    update_cmd._commit_staged_replacements(staged)
 
-    def _calls(node, name):
-        return any(
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == name
-            for n in ast.walk(node)
-        )
+    assert (live / "apps/desktop/main.ts").read_text() == "new source"
+    assert (live / "apps/desktop/release/win-unpacked/Hermes.exe").read_bytes() == b"old-exe"
+    assert (live / "apps/desktop/dist/index.html").read_text() == "old-dist"
+    assert not (live / "apps/desktop/stale.ts").exists()
+    assert not (live / "apps/desktop/arbitrary.cache").exists()
+    assert not [p for p in live.rglob("*") if "hermes-update" in p.name]
 
-    wired = False
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Try):
-            continue
-        body_commits = any(
-            _calls(stmt, "_commit_staged_replacements") for stmt in node.body
-        )
-        handler_discards = any(
-            _calls(handler, "_discard_staged") for handler in node.handlers
-        )
-        if body_commits and handler_discards:
-            wired = True
-            break
-    assert wired, (
-        "_update_via_zip no longer discards staging copies when "
-        "_commit_staged_replacements fails — commit-phase litter will make "
-        "the retry's free-space check fail harder than the first attempt"
-    )
+
+def test_zip_apps_swap_rolls_back_artifacts_with_source(tmp_path, monkeypatch):
+    """A failed ZIP swap restores both source and Desktop artifacts."""
+    live = tmp_path / "live"
+    extracted = tmp_path / "extracted"
+    _live_tree(live, {"agent": "old"})
+    _live_tree(extracted, {"agent": "new"})
+    (live / "apps/desktop/release/win-unpacked").mkdir(parents=True)
+    (live / "apps/desktop/release/win-unpacked/Hermes.exe").write_bytes(b"old")
+    (extracted / "apps/desktop").mkdir(parents=True)
+    (extracted / "apps/desktop/main.ts").write_text("new")
+    staged = update_cmd._stage_zip_entries(extracted, live, ["agent", "apps"])
+    real_rename = update_cmd.os.rename
+    calls = {"count": 0}
+
+    def fail_during_second_swap(src, dst):
+        calls["count"] += 1
+        if calls["count"] == 4:
+            raise OSError("simulated rename failure")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(update_cmd.os, "rename", fail_during_second_swap)
+    with pytest.raises(OSError):
+        try:
+            update_cmd._commit_staged_replacements(staged)
+        except OSError:
+            update_cmd._discard_staged(staged)
+            raise
+
+    assert (live / "agent/version.txt").read_text() == "old"
+    assert (live / "apps/desktop/release/win-unpacked/Hermes.exe").read_bytes() == b"old"
+
+
+def test_zip_staging_size_includes_preserved_desktop_bytes(tmp_path):
+    """The preflight reserve includes retained Desktop package files."""
+    live = tmp_path / "live"
+    extracted = tmp_path / "extracted"
+    (extracted / "apps").mkdir(parents=True)
+    (extracted / "apps/source.txt").write_bytes(b"1234")
+    (live / "apps/desktop/release").mkdir(parents=True)
+    (live / "apps/desktop/release/Hermes.exe").write_bytes(b"123456")
+
+    assert update_cmd._zip_staging_size(extracted, ["apps"], live) == 10
