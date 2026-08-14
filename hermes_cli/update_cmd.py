@@ -941,6 +941,62 @@ def _update_complete_message(pre_version: str | None) -> str:
     return "✓ Update complete!"
 
 
+def _desktop_was_installed(desktop_dir: Path) -> bool:
+    """Return whether a packaged or renderer Desktop build existed before update."""
+    return (
+        _m()._desktop_packaged_executable(desktop_dir) is not None
+        or _m()._desktop_dist_exists(desktop_dir)
+    )
+
+
+def _maybe_rebuild_desktop(was_installed: bool) -> bool:
+    """Rebuild a previously installed Desktop app after a source update."""
+    if not was_installed:
+        return True
+
+    desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
+    if not (
+        (desktop_dir / "package.json").exists()
+        and _m()._resolve_node_runtime_npm()
+    ):
+        return True
+
+    print("→ Checking if desktop app needs rebuilding...")
+    try:
+        skip_desktop_build = not _m()._desktop_build_needed(
+            desktop_dir, _m().PROJECT_ROOT, source_mode=False
+        )
+    except Exception:
+        skip_desktop_build = False
+    if skip_desktop_build:
+        print("  ✓ Desktop app up to date")
+        return True
+
+    from hermes_constants import with_hermes_node_path
+
+    build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
+    build_env = with_hermes_node_path()
+    build_result = _m()._run_logged_subprocess(
+        build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
+    )
+    if build_result.returncode != 0:
+        build_result = _m()._run_logged_subprocess(
+            build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
+        )
+    if build_result.returncode == 0:
+        print("  ✓ Desktop app up to date")
+        return True
+
+    print("  ⚠ Desktop build failed (non-fatal; run `hermes desktop` to retry)")
+    tail = "\n".join((build_result.stdout or "").strip().splitlines()[-15:])
+    if tail:
+        print(tail)
+    from hermes_constants import display_hermes_home as _dhh
+
+    print(f"  Full build log: {_dhh()}/logs/update.log")
+    return False
+
+
 def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
     """Update Hermes Agent by downloading a ZIP archive.
 
@@ -956,6 +1012,9 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
     # Snapshot the pre-update version before files are replaced so the
     # completion line can report the transition (prime-agent#630 port).
     pre_update_version = _read_project_version()
+    desktop_was_installed = had_desktop_app_before_update or _desktop_was_installed(
+        _m().PROJECT_ROOT / "apps" / "desktop"
+    )
 
     # The ZIP fallback exists for Windows git-file-I/O breakage. It pulls a
     # static archive from GitHub, which is fine for the default "main"
@@ -1179,10 +1238,8 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
 
     node_failures = _update_node_dependencies()
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
-    _rebuild_desktop_after_update(
-        _m().PROJECT_ROOT / "apps" / "desktop",
-        had_desktop_app_before_update=had_desktop_app_before_update,
-    )
+    if not _maybe_rebuild_desktop(desktop_was_installed):
+        print("  ⚠ Desktop build failed (non-fatal; the previous package was preserved)")
 
     # Sync skills
     try:
@@ -4707,6 +4764,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         return
 
+    desktop_was_installed = _desktop_was_installed(
+        _m().PROJECT_ROOT / "apps" / "desktop"
+    )
+
     # Fetch and pull
     try:
 
@@ -5287,10 +5348,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         node_failures = _update_node_dependencies()
         _m()._build_web_ui(_m().PROJECT_ROOT / "web")
 
-        _rebuild_desktop_after_update(
-            desktop_dir,
-            had_desktop_app_before_update=had_desktop_app_before_update,
-        )
+        _maybe_rebuild_desktop(desktop_was_installed)
 
         print()
         print("✓ Code updated!")
