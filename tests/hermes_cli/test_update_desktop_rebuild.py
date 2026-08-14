@@ -1,7 +1,11 @@
+import errno
 import json
 import os
 import shutil
 import struct
+import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,6 +17,11 @@ from hermes_cli import update_cmd
 
 
 PE_AMD64 = 0x8664
+VALID_INSTALL_STAMP = {
+    "schemaVersion": 1,
+    "commit": "1234567890abcdef1234567890abcdef12345678",
+    "branch": "main",
+}
 
 
 def _valid_pe(marker=b""):
@@ -25,28 +34,43 @@ def _valid_pe(marker=b""):
     return bytes(buf) + marker
 
 
+def _write_complete_package(package, executable_bytes, *, asar_bytes=b"app-asar"):
+    resources = package / "resources"
+    resources.mkdir(parents=True)
+    (package / "Hermes.exe").write_bytes(executable_bytes)
+    (resources / "app.asar").write_bytes(asar_bytes)
+    (resources / "install-stamp.json").write_text(
+        json.dumps(VALID_INSTALL_STAMP), encoding="utf-8"
+    )
+    return package
+
+
 def _prepare_rebuild(tmp_path, monkeypatch, previous_bytes=None):
     desktop = tmp_path / "apps/desktop"
     desktop.mkdir(parents=True)
     (desktop / "package.json").write_text("{}")
     live = desktop / "release" / "win-unpacked"
     if previous_bytes is not None:
-        live.mkdir(parents=True)
-        (live / "Hermes.exe").write_bytes(previous_bytes)
+        _write_complete_package(live, previous_bytes)
     monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(update_cmd._m(), "_resolve_node_runtime_npm", lambda: "npm.cmd")
     monkeypatch.setattr(update_cmd._m(), "_desktop_build_needed", lambda *a, **k: True)
     return live
 
 
-def _simulate_pack(live, output_bytes, returncode=1, error=None):
+def _simulate_pack(
+    live, output_bytes, returncode=1, error=None, *, complete_package=False
+):
     backup = live.with_name("win-unpacked.bak")
     if live.exists():
         if backup.exists():
             shutil.rmtree(backup)
         live.rename(backup)
-    live.mkdir(parents=True)
-    (live / "Hermes.exe").write_bytes(output_bytes)
+    if complete_package:
+        _write_complete_package(live, output_bytes)
+    else:
+        live.mkdir(parents=True)
+        (live / "Hermes.exe").write_bytes(output_bytes)
     if error is not None:
         raise error
     return SimpleNamespace(returncode=returncode, stdout="failed")
@@ -62,19 +86,65 @@ def _recovery_root(project_root):
 
 def _write_recovery_snapshot(project_root, package_bytes):
     snapshot = _recovery_root(project_root) / "snapshot" / "win-unpacked"
-    snapshot.mkdir(parents=True)
-    (snapshot / "Hermes.exe").write_bytes(package_bytes)
+    _write_complete_package(snapshot, package_bytes)
     return snapshot
 
 
-def _write_rebuild_lock(project_root, pid, start_time):
-    lock = _recovery_root(project_root) / "lock"
-    lock.mkdir(parents=True)
-    (lock / "owner.json").write_text(
-        json.dumps({"pid": pid, "start_time": start_time, "token": "other-owner"}),
+def _make_windows_junction(link: Path, target: Path) -> None:
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
         encoding="utf-8",
     )
-    return lock
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        pytest.skip(
+            "native Windows directory junction creation unavailable via "
+            f"unprivileged mklink /J (exit {result.returncode}): {detail}"
+        )
+
+
+def _unsafe_ancestor_fixture(tmp_path, monkeypatch, ancestor, create_link):
+    project_root = tmp_path / "agent"
+    apps = project_root / "apps"
+    apps.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    if ancestor == "desktop":
+        external_desktop = outside / "desktop"
+        external_desktop.mkdir()
+        (external_desktop / "package.json").write_text("{}")
+        external_release = external_desktop / "release"
+        link = apps / "desktop"
+        target = external_desktop
+    else:
+        desktop = apps / "desktop"
+        desktop.mkdir()
+        (desktop / "package.json").write_text("{}")
+        external_release = outside / "release"
+        external_release.mkdir()
+        link = desktop / "release"
+        target = external_release
+
+    external_live = _write_complete_package(
+        external_release / "win-unpacked", _valid_pe(b"external-package")
+    )
+    marker = outside / "external-marker.bin"
+    marker.write_bytes(b"outside-unchanged")
+    create_link(link, target)
+    snapshot = _write_recovery_snapshot(
+        project_root, _valid_pe(b"original-package")
+    )
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(
+        update_cmd._m(), "_resolve_node_runtime_npm", lambda: "npm.cmd"
+    )
+    monkeypatch.setattr(
+        update_cmd._m(), "_desktop_build_needed", lambda *a, **k: True
+    )
+    return project_root, external_live, marker, snapshot
 
 
 def test_previously_installed_desktop_rebuilds_when_output_is_missing(tmp_path, monkeypatch):
@@ -89,8 +159,7 @@ def test_previously_installed_desktop_rebuilds_when_output_is_missing(tmp_path, 
     def run_build(cmd, **kwargs):
         calls.append(cmd)
         live = desktop / "release" / "win-unpacked"
-        live.mkdir(parents=True)
-        (live / "Hermes.exe").write_bytes(_valid_pe(b"new-package"))
+        _write_complete_package(live, _valid_pe(b"new-package"))
         return SimpleNamespace(returncode=0, stdout="")
 
     monkeypatch.setattr(
@@ -197,7 +266,12 @@ def test_successful_retry_keeps_new_package_and_removes_snapshot(tmp_path, monke
 
     def run_pack(*args, **kwargs):
         output_bytes, returncode = next(outcomes)
-        return _simulate_pack(live, output_bytes, returncode)
+        return _simulate_pack(
+            live,
+            output_bytes,
+            returncode,
+            complete_package=returncode == 0,
+        )
 
     monkeypatch.setattr(update_cmd._m(), "_run_logged_subprocess", run_pack)
 
@@ -272,8 +346,7 @@ def test_recovery_snapshot_does_not_stale_desktop_content_stamp(
     (desktop / "dist").mkdir()
     (desktop / "dist" / "index.html").write_text("ready")
     live = desktop / "release" / "win-unpacked"
-    live.mkdir(parents=True)
-    (live / "Hermes.exe").write_bytes(_valid_pe(b"original-package"))
+    _write_complete_package(live, _valid_pe(b"original-package"))
     (tmp_path / ".gitignore").write_text(
         "/venv/\napps/desktop/dist/\napps/desktop/release/\n"
     )
@@ -316,7 +389,9 @@ def test_orphan_snapshot_recovers_before_rebuild(
 
     def run_pack(*args, **kwargs):
         observed_before_build.append((live / "Hermes.exe").read_bytes())
-        return _simulate_pack(live, new_package, returncode=0)
+        return _simulate_pack(
+            live, new_package, returncode=0, complete_package=True
+        )
 
     monkeypatch.setattr(update_cmd._m(), "_run_logged_subprocess", run_pack)
 
@@ -347,40 +422,208 @@ def test_orphan_snapshot_is_cleaned_when_live_package_is_valid(
     assert not snapshot.exists()
 
 
-def test_active_rebuild_lock_rejects_concurrent_invocation(tmp_path, monkeypatch):
-    from gateway.status import _get_process_start_time
-
+@pytest.mark.windows_only
+@pytest.mark.parametrize(
+    "damaged_resource",
+    (
+        "missing-app-asar",
+        "empty-app-asar",
+        "missing-install-stamp",
+        "empty-install-stamp",
+        "invalid-install-stamp",
+    ),
+)
+def test_orphan_snapshot_restores_package_with_incomplete_resources_before_stamp_skip(
+    tmp_path, monkeypatch, damaged_resource
+):
     original = _valid_pe(b"original-package")
-    live = _prepare_rebuild(tmp_path, monkeypatch, original)
-    start_time = _get_process_start_time(os.getpid())
-    assert start_time is not None
-    lock = _write_rebuild_lock(tmp_path, os.getpid(), start_time)
+    live = _prepare_rebuild(tmp_path, monkeypatch, _valid_pe(b"incomplete-package"))
+    resource = {
+        "missing-app-asar": live / "resources" / "app.asar",
+        "empty-app-asar": live / "resources" / "app.asar",
+        "missing-install-stamp": live / "resources" / "install-stamp.json",
+        "empty-install-stamp": live / "resources" / "install-stamp.json",
+        "invalid-install-stamp": live / "resources" / "install-stamp.json",
+    }[damaged_resource]
+    if damaged_resource.startswith("missing"):
+        resource.unlink()
+    elif damaged_resource == "invalid-install-stamp":
+        resource.write_text('{"schemaVersion": 999}', encoding="utf-8")
+    else:
+        resource.write_bytes(b"")
+    snapshot = _write_recovery_snapshot(tmp_path, original)
+    monkeypatch.setattr(
+        update_cmd._m(), "_desktop_build_needed", lambda *a, **k: False
+    )
 
     with patch.object(update_cmd._m(), "_run_logged_subprocess") as run:
-        assert update_cmd._maybe_rebuild_desktop(True) is False
+        assert update_cmd._maybe_rebuild_desktop(True) is True
 
     run.assert_not_called()
     assert (live / "Hermes.exe").read_bytes() == original
-    assert json.loads((lock / "owner.json").read_text(encoding="utf-8"))[
-        "token"
-    ] == "other-owner"
+    assert (live / "resources" / "app.asar").read_bytes() == b"app-asar"
+    assert json.loads(
+        (live / "resources" / "install-stamp.json").read_text(encoding="utf-8")
+    ) == VALID_INSTALL_STAMP
+    assert not snapshot.exists()
 
 
-def test_stale_rebuild_lock_is_reclaimed(tmp_path, monkeypatch):
-    live = _prepare_rebuild(
-        tmp_path, monkeypatch, _valid_pe(b"original-package")
+@pytest.mark.require_symlinks
+@pytest.mark.parametrize("ancestor", ("desktop", "release"))
+def test_rebuild_rejects_symlinked_package_ancestor_without_touching_external_tree(
+    tmp_path, monkeypatch, ancestor
+):
+    project_root, external_live, marker, snapshot = _unsafe_ancestor_fixture(
+        tmp_path,
+        monkeypatch,
+        ancestor,
+        lambda link, target: link.symlink_to(target, target_is_directory=True),
     )
-    lock = _write_rebuild_lock(tmp_path, 2_147_483_646, 0)
-    new_package = _valid_pe(b"new-package")
+    calls = []
     monkeypatch.setattr(
         update_cmd._m(),
         "_run_logged_subprocess",
-        lambda *a, **k: _simulate_pack(live, new_package, returncode=0),
+        lambda *a, **k: calls.append(a)
+        or SimpleNamespace(returncode=1, stdout="unsafe"),
     )
 
-    assert update_cmd._maybe_rebuild_desktop(True) is True
-    assert (live / "Hermes.exe").read_bytes() == new_package
-    assert not lock.exists()
+    assert update_cmd._maybe_rebuild_desktop(True) is False
+    assert calls == []
+    assert marker.read_bytes() == b"outside-unchanged"
+    assert (external_live / "Hermes.exe").read_bytes() == _valid_pe(
+        b"external-package"
+    )
+    assert sorted(path.name for path in external_live.parent.iterdir()) == [
+        "win-unpacked"
+    ]
+    assert snapshot.is_dir()
+    recovery_root = _recovery_root(project_root)
+    assert not (recovery_root / "snapshot.new").exists()
+    assert not (recovery_root / "failed-live").exists()
+
+
+@pytest.mark.windows_only
+@pytest.mark.parametrize("ancestor", ("desktop", "release"))
+def test_rebuild_rejects_junction_package_ancestor_without_touching_external_tree(
+    tmp_path, monkeypatch, ancestor
+):
+    project_root, external_live, marker, snapshot = _unsafe_ancestor_fixture(
+        tmp_path, monkeypatch, ancestor, _make_windows_junction
+    )
+    calls = []
+    monkeypatch.setattr(
+        update_cmd._m(),
+        "_run_logged_subprocess",
+        lambda *a, **k: calls.append(a)
+        or SimpleNamespace(returncode=1, stdout="unsafe"),
+    )
+
+    assert update_cmd._maybe_rebuild_desktop(True) is False
+    assert calls == []
+    assert marker.read_bytes() == b"outside-unchanged"
+    assert (external_live / "Hermes.exe").read_bytes() == _valid_pe(
+        b"external-package"
+    )
+    assert sorted(path.name for path in external_live.parent.iterdir()) == [
+        "win-unpacked"
+    ]
+    assert snapshot.is_dir()
+    recovery_root = _recovery_root(project_root)
+    assert not (recovery_root / "snapshot.new").exists()
+    assert not (recovery_root / "failed-live").exists()
+
+
+def test_os_rebuild_lock_is_exclusive_and_leftover_file_is_reacquirable(tmp_path):
+    first = update_cmd._acquire_desktop_rebuild_lock(tmp_path)
+    assert first is not None
+    try:
+        assert update_cmd._acquire_desktop_rebuild_lock(tmp_path) is None
+    finally:
+        update_cmd._release_desktop_rebuild_lock(first)
+
+    lock_path = _recovery_root(tmp_path) / "rebuild.lock"
+    assert lock_path.is_file()
+    reacquired = update_cmd._acquire_desktop_rebuild_lock(tmp_path)
+    assert reacquired is not None
+    update_cmd._release_desktop_rebuild_lock(reacquired)
+
+
+@pytest.mark.windows_only
+def test_os_rebuild_lock_retries_transient_windows_release_delay(
+    tmp_path, monkeypatch
+):
+    import msvcrt
+
+    real_locking = msvcrt.locking
+    attempts = 0
+
+    def delayed_locking(descriptor, mode, byte_count):
+        nonlocal attempts
+        if mode == msvcrt.LK_NBLCK:
+            attempts += 1
+            if attempts < 3:
+                raise OSError(errno.EACCES, "lock release still propagating")
+        return real_locking(descriptor, mode, byte_count)
+
+    monkeypatch.setattr(msvcrt, "locking", delayed_locking)
+
+    lock = update_cmd._acquire_desktop_rebuild_lock(tmp_path)
+
+    assert lock is not None
+    assert attempts == 3
+    update_cmd._release_desktop_rebuild_lock(lock)
+
+
+def test_active_os_rebuild_lock_rejects_build_within_bounded_wait(
+    tmp_path, monkeypatch
+):
+    _prepare_rebuild(tmp_path, monkeypatch, _valid_pe(b"original-package"))
+    first = update_cmd._acquire_desktop_rebuild_lock(tmp_path)
+    assert first is not None
+    started = time.monotonic()
+    try:
+        with patch.object(update_cmd._m(), "_run_logged_subprocess") as run:
+            assert update_cmd._maybe_rebuild_desktop(True) is False
+        run.assert_not_called()
+    finally:
+        update_cmd._release_desktop_rebuild_lock(first)
+    assert time.monotonic() - started < 2
+
+
+def test_abrupt_process_exit_releases_os_rebuild_lock(tmp_path):
+    code = "\n".join(
+        (
+            "import time",
+            "from pathlib import Path",
+            "from hermes_cli import update_cmd",
+            f"lock = update_cmd._acquire_desktop_rebuild_lock(Path({str(tmp_path)!r}))",
+            "assert lock is not None",
+            "print('LOCKED', flush=True)",
+            "time.sleep(60)",
+        )
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code],
+        cwd=Path.cwd(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "LOCKED"
+        assert update_cmd._acquire_desktop_rebuild_lock(tmp_path) is None
+        child.kill()
+        child.wait(timeout=10)
+
+        recovered = update_cmd._acquire_desktop_rebuild_lock(tmp_path)
+        assert recovered is not None
+        update_cmd._release_desktop_rebuild_lock(recovered)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
 
 
 @pytest.mark.windows_only
@@ -394,7 +637,9 @@ def test_snapshot_cleanup_failure_does_not_fail_successful_build(
     monkeypatch.setattr(
         update_cmd._m(),
         "_run_logged_subprocess",
-        lambda *a, **k: _simulate_pack(live, new_package, returncode=0),
+        lambda *a, **k: _simulate_pack(
+            live, new_package, returncode=0, complete_package=True
+        ),
     )
     monkeypatch.setattr(
         update_cmd,
@@ -417,7 +662,9 @@ def test_lock_cleanup_failure_does_not_fail_successful_build(
     monkeypatch.setattr(
         update_cmd._m(),
         "_run_logged_subprocess",
-        lambda *a, **k: _simulate_pack(live, new_package, returncode=0),
+        lambda *a, **k: _simulate_pack(
+            live, new_package, returncode=0, complete_package=True
+        ),
     )
     monkeypatch.setattr(
         update_cmd,
@@ -428,5 +675,5 @@ def test_lock_cleanup_failure_does_not_fail_successful_build(
 
     assert update_cmd._maybe_rebuild_desktop(True) is True
     assert (live / "Hermes.exe").read_bytes() == new_package
-    assert (_recovery_root(tmp_path) / "lock").exists()
+    assert (_recovery_root(tmp_path) / "rebuild.lock").is_file()
     assert "lock busy" in capsys.readouterr().out
