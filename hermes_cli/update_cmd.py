@@ -1182,10 +1182,143 @@ def _desktop_was_installed(desktop_dir: Path) -> bool:
     )
 
 
-def _snapshot_windows_desktop_package(desktop_dir: Path):
-    """Move the current Windows package outside electron-builder's paths."""
-    import tempfile
+@dataclass(frozen=True)
+class _DesktopRebuildLock:
+    path: Path
+    token: str
 
+
+def _desktop_recovery_root(project_root: Path) -> Path:
+    return project_root / "venv" / ".desktop-update-recovery"
+
+
+def _ensure_desktop_recovery_root(project_root: Path) -> Path:
+    """Create the ignored program-state directory without following reparses."""
+    venv_dir = project_root / "venv"
+    try:
+        venv_info = _safe_payload_lstat(venv_dir)
+    except FileNotFoundError:
+        venv_dir.mkdir()
+        venv_info = _safe_payload_lstat(venv_dir)
+    if not stat.S_ISDIR(venv_info.st_mode):
+        raise ValueError(f"Desktop recovery parent is not a directory: {venv_dir}")
+
+    recovery_root = _desktop_recovery_root(project_root)
+    try:
+        recovery_info = _safe_payload_lstat(recovery_root)
+    except FileNotFoundError:
+        recovery_root.mkdir()
+        recovery_info = _safe_payload_lstat(recovery_root)
+    if not stat.S_ISDIR(recovery_info.st_mode):
+        raise ValueError(f"Desktop recovery path is not a directory: {recovery_root}")
+    return recovery_root
+
+
+def _desktop_lock_owner_is_stale(lock_path: Path) -> bool:
+    """Return True only when the recorded lock owner is demonstrably gone."""
+    try:
+        owner_path = lock_path / "owner.json"
+        owner_info = _safe_payload_lstat(owner_path)
+        if not stat.S_ISREG(owner_info.st_mode):
+            return False
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        pid = owner["pid"]
+        recorded_start = owner["start_time"]
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if type(pid) is not int or pid <= 0:
+        return False
+
+    from gateway.status import _get_process_start_time, _pid_exists
+
+    if not _pid_exists(pid):
+        return True
+    live_start = _get_process_start_time(pid)
+    return (
+        type(recorded_start) is int
+        and live_start is not None
+        and live_start != recorded_start
+    )
+
+
+def _acquire_desktop_rebuild_lock(project_root: Path):
+    """Atomically acquire the rebuild lock, reclaiming only stale owners."""
+    recovery_root = _ensure_desktop_recovery_root(project_root)
+    lock_path = recovery_root / "lock"
+    token = f"{os.getpid()}-{_time.time_ns()}-{os.urandom(4).hex()}"
+
+    for attempt in range(2):
+        try:
+            os.mkdir(lock_path)
+        except FileExistsError:
+            lock_info = _safe_payload_lstat(lock_path)
+            if not stat.S_ISDIR(lock_info.st_mode):
+                raise ValueError(f"Desktop rebuild lock is not a directory: {lock_path}")
+            if attempt or not _desktop_lock_owner_is_stale(lock_path):
+                return None
+            stale_path = recovery_root / f"lock.stale-{token}"
+            os.rename(lock_path, stale_path)
+            try:
+                _discard_desktop_build_path(stale_path)
+            except Exception as exc:
+                print(f"  ⚠ Could not clean stale Desktop rebuild lock: {exc}")
+            continue
+
+        try:
+            from gateway.status import _get_process_start_time
+
+            owner = {
+                "pid": os.getpid(),
+                "start_time": _get_process_start_time(os.getpid()),
+                "token": token,
+            }
+            (lock_path / "owner.json").write_text(
+                json.dumps(owner, sort_keys=True), encoding="utf-8"
+            )
+        except Exception:
+            try:
+                _discard_desktop_build_path(lock_path)
+            except Exception:
+                pass
+            raise
+        return _DesktopRebuildLock(lock_path, token)
+    return None
+
+
+def _release_desktop_rebuild_lock(lock: _DesktopRebuildLock) -> None:
+    """Release only the lock still carrying our owner token."""
+    owner_path = lock.path / "owner.json"
+    owner_info = _safe_payload_lstat(owner_path)
+    if not stat.S_ISREG(owner_info.st_mode):
+        raise OSError("Desktop rebuild lock owner is not a regular file")
+    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    if owner.get("token") != lock.token:
+        raise OSError("Desktop rebuild lock ownership changed")
+    cleanup_path = lock.path.with_name(f"lock.done-{lock.token}")
+    os.rename(lock.path, cleanup_path)
+    _discard_desktop_build_path(cleanup_path)
+
+
+def _validated_windows_desktop_package(path: Path) -> _PayloadManifest:
+    manifest = _validated_payload_manifest(path)
+    if not manifest.entries or manifest.entries[0].kind != "directory":
+        raise ValueError(f"Windows Desktop package is missing: {path}")
+    error = _m()._desktop_exe_integrity_error(path / "Hermes.exe")
+    if error is not None:
+        raise ValueError(f"Windows Desktop package is invalid: {error}")
+    return manifest
+
+
+def _windows_desktop_package_is_valid(path: Path) -> bool:
+    try:
+        _validated_windows_desktop_package(path)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _snapshot_windows_desktop_package(desktop_dir: Path):
+    """Durably copy the current Windows package while leaving it live."""
     live = desktop_dir / "release" / "win-unpacked"
     try:
         live_info = _safe_payload_lstat(live)
@@ -1193,20 +1326,30 @@ def _snapshot_windows_desktop_package(desktop_dir: Path):
         return None
     if not stat.S_ISDIR(live_info.st_mode):
         raise ValueError(f"Desktop package path is not a directory: {live}")
+    manifest = _validated_payload_manifest(live)
+    if _m()._desktop_exe_integrity_error(live / "Hermes.exe") is not None:
+        return None
 
-    # Validate before moving so cleanup never follows a symlink, junction, or
-    # other reparse point hidden inside the package tree.
-    _validated_payload_manifest(live)
-    snapshot_root = Path(
-        tempfile.mkdtemp(prefix=".hermes-update-desktop-", dir=desktop_dir)
-    )
-    snapshot = snapshot_root / "win-unpacked"
+    recovery_root = _ensure_desktop_recovery_root(_m().PROJECT_ROOT)
+    snapshot_root = recovery_root / "snapshot"
+    staging_root = recovery_root / "snapshot.new"
+    if os.path.lexists(snapshot_root):
+        raise OSError(
+            f"existing Desktop recovery snapshot was not cleared: {snapshot_root}"
+        )
+    _discard_desktop_build_path(staging_root)
+    snapshot = staging_root / "win-unpacked"
     try:
-        os.rename(live, snapshot)
+        _copy_validated_payload(live, snapshot, manifest)
+        _validated_windows_desktop_package(snapshot)
+        os.rename(staging_root, snapshot_root)
     except Exception:
-        snapshot_root.rmdir()
+        try:
+            _discard_desktop_build_path(staging_root)
+        except Exception:
+            pass
         raise
-    return live, snapshot, snapshot_root
+    return live, snapshot_root / "win-unpacked", snapshot_root
 
 
 def _discard_desktop_build_path(path: Path) -> None:
@@ -1223,28 +1366,95 @@ def _discard_desktop_build_path(path: Path) -> None:
 
 
 def _restore_windows_desktop_package(snapshot) -> None:
-    """Atomically put the pre-build Windows package back in its live path."""
+    """Copy then atomically restore the durable pre-build Windows package."""
     live, preserved, snapshot_root = snapshot
-    failed = snapshot_root / "failed-build"
-    if os.path.lexists(live):
-        os.rename(live, failed)
+    manifest = _validated_windows_desktop_package(preserved)
+    recovery_root = snapshot_root.parent
+    failed = recovery_root / "failed-live"
+    staging = live.with_name("win-unpacked.hermes-recovery-staging")
+    release = live.parent
     try:
-        os.rename(preserved, live)
+        release_info = _safe_payload_lstat(release)
+    except FileNotFoundError:
+        release.mkdir(parents=True)
+        release_info = _safe_payload_lstat(release)
+    if not stat.S_ISDIR(release_info.st_mode):
+        raise ValueError(f"Desktop release path is not a directory: {release}")
+
+    _discard_desktop_build_path(staging)
+    _discard_desktop_build_path(failed)
+    _copy_validated_payload(preserved, staging, manifest)
+    _validated_windows_desktop_package(staging)
+    moved_live = False
+    try:
+        if os.path.lexists(live):
+            os.rename(live, failed)
+            moved_live = True
+        os.rename(staging, live)
     except Exception:
         if not os.path.lexists(live) and os.path.lexists(failed):
             os.rename(failed, live)
         raise
-    _discard_desktop_build_path(failed)
-    snapshot_root.rmdir()
+    _validated_windows_desktop_package(live)
+    if moved_live:
+        try:
+            _discard_desktop_build_path(failed)
+        except Exception as exc:
+            print(f"  ⚠ Could not clean failed Desktop package: {exc}")
 
 
 def _discard_windows_desktop_snapshot(snapshot) -> None:
     """Remove a no-longer-needed pre-build package snapshot."""
     if snapshot is None:
         return
-    _live, preserved, snapshot_root = snapshot
-    _discard_desktop_build_path(preserved)
-    snapshot_root.rmdir()
+    _live, _preserved, snapshot_root = snapshot
+    _discard_desktop_build_path(snapshot_root)
+
+
+def _prepare_windows_desktop_recovery(desktop_dir: Path):
+    """Recover an interrupted rebuild before any new builder process starts."""
+    recovery_root = _ensure_desktop_recovery_root(_m().PROJECT_ROOT)
+    snapshot_root = recovery_root / "snapshot"
+    if not os.path.lexists(snapshot_root):
+        return None, True
+
+    live = desktop_dir / "release" / "win-unpacked"
+    snapshot = (live, snapshot_root / "win-unpacked", snapshot_root)
+    try:
+        _validated_windows_desktop_package(snapshot[1])
+    except Exception as exc:
+        if _windows_desktop_package_is_valid(live):
+            try:
+                _discard_windows_desktop_snapshot(snapshot)
+            except Exception as cleanup_exc:
+                print(
+                    "  ⚠ Could not clean invalid Desktop recovery state: "
+                    f"{cleanup_exc}"
+                )
+            return None, True
+        print(f"  ⚠ Desktop recovery snapshot is unusable: {exc}")
+        return snapshot, False
+
+    if _windows_desktop_package_is_valid(live):
+        try:
+            _discard_windows_desktop_snapshot(snapshot)
+        except Exception as exc:
+            print(f"  ⚠ Could not clean completed Desktop recovery state: {exc}")
+        return None, True
+
+    try:
+        _restore_windows_desktop_package(snapshot)
+    except Exception as exc:
+        print(f"  ⚠ Could not recover the previous Desktop package: {exc}")
+        return snapshot, False
+    return snapshot, True
+
+
+def _best_effort_desktop_cleanup(action, label: str) -> None:
+    try:
+        action()
+    except Exception as exc:
+        print(f"  ⚠ Could not clean {label}: {exc}")
 
 
 def _maybe_rebuild_desktop(was_installed: bool) -> bool:
@@ -1252,76 +1462,149 @@ def _maybe_rebuild_desktop(was_installed: bool) -> bool:
     if not was_installed:
         return True
 
-    desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
-    if not (desktop_dir / "package.json").exists():
-        print("  ⚠ Desktop build unavailable: updated source is missing apps/desktop/package.json")
-        return False
-    if not _m()._resolve_node_runtime_npm():
-        print("  ⚠ Desktop build unavailable: managed Node/npm runtime was not found")
-        return False
-
-    print("→ Checking if desktop app needs rebuilding...")
+    project_root = _m().PROJECT_ROOT
+    desktop_dir = project_root / "apps" / "desktop"
     try:
-        skip_desktop_build = not _m()._desktop_build_needed(
-            desktop_dir, _m().PROJECT_ROOT, source_mode=False
-        )
-    except Exception:
-        skip_desktop_build = False
-    if skip_desktop_build:
-        print("  ✓ Desktop app up to date")
-        return True
-
-    from hermes_constants import with_hermes_node_path
-
-    build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
-    build_env = with_hermes_node_path()
-    try:
-        package_snapshot = _snapshot_windows_desktop_package(desktop_dir)
+        rebuild_lock = _acquire_desktop_rebuild_lock(project_root)
     except Exception as exc:
-        print(f"  ⚠ Desktop build unavailable: could not preserve previous package ({exc})")
+        print(f"  ⚠ Desktop build unavailable: could not acquire rebuild lock ({exc})")
+        return False
+    if rebuild_lock is None:
+        print("  ⚠ Desktop build unavailable: another rebuild is already active")
         return False
 
-    build_error = None
-    build_result = None
     try:
-        build_result = _m()._run_logged_subprocess(
-            build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
-        )
-        if build_result.returncode != 0:
-            build_result = _m()._run_logged_subprocess(
-                build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
+        package_snapshot = None
+        if sys.platform == "win32":
+            package_snapshot, recovery_ready = _prepare_windows_desktop_recovery(
+                desktop_dir
             )
-    except Exception as exc:
-        build_error = exc
+            if not recovery_ready:
+                return False
 
-    builder_backup = desktop_dir / "release" / "win-unpacked.bak"
-    if build_result is not None and build_result.returncode == 0:
-        _discard_windows_desktop_snapshot(package_snapshot)
-        _discard_desktop_build_path(builder_backup)
-        print("  ✓ Desktop app up to date")
-        return True
+        if not (desktop_dir / "package.json").exists():
+            print(
+                "  ⚠ Desktop build unavailable: updated source is missing "
+                "apps/desktop/package.json"
+            )
+            return False
+        if not _m()._resolve_node_runtime_npm():
+            print("  ⚠ Desktop build unavailable: managed Node/npm runtime was not found")
+            return False
 
-    if package_snapshot is not None:
+        print("→ Checking if desktop app needs rebuilding...")
+        builder_backup = desktop_dir / "release" / "win-unpacked.bak"
         try:
-            _restore_windows_desktop_package(package_snapshot)
+            skip_desktop_build = not _m()._desktop_build_needed(
+                desktop_dir, project_root, source_mode=False
+            )
+        except Exception:
+            skip_desktop_build = False
+        if skip_desktop_build:
+            if package_snapshot is not None:
+                _best_effort_desktop_cleanup(
+                    lambda: _discard_windows_desktop_snapshot(package_snapshot),
+                    "Desktop recovery snapshot",
+                )
+            _best_effort_desktop_cleanup(
+                lambda: _discard_desktop_build_path(builder_backup),
+                "Desktop builder backup",
+            )
+            print("  ✓ Desktop app up to date")
+            return True
+
+        from hermes_constants import with_hermes_node_path
+
+        build_cmd = [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "desktop",
+            "--build-only",
+        ]
+        build_env = with_hermes_node_path()
+        if sys.platform == "win32" and package_snapshot is None:
+            try:
+                package_snapshot = _snapshot_windows_desktop_package(desktop_dir)
+            except Exception as exc:
+                print(
+                    "  ⚠ Desktop build unavailable: could not preserve previous "
+                    f"package ({exc})"
+                )
+                return False
+
+        build_error = None
+        build_result = None
+        build_succeeded = False
+        validation_error = None
+        try:
+            for _attempt in range(2):
+                build_result = _m()._run_logged_subprocess(
+                    build_cmd, cwd=project_root, env=build_env
+                )
+                if build_result.returncode != 0:
+                    continue
+                if sys.platform == "win32":
+                    live = desktop_dir / "release" / "win-unpacked"
+                    try:
+                        _validated_windows_desktop_package(live)
+                    except Exception as exc:
+                        validation_error = exc
+                        continue
+                build_succeeded = True
+                break
         except Exception as exc:
-            print(f"  ⚠ Could not restore the previous Desktop package: {exc}")
-    _discard_desktop_build_path(builder_backup)
+            build_error = exc
 
-    print("  ⚠ Desktop build failed (non-fatal; run `hermes desktop` to retry)")
-    if build_error is not None:
-        print(f"  {build_error}")
-    tail = "\n".join(
-        ((build_result.stdout if build_result is not None else "") or "")
-        .strip()
-        .splitlines()[-15:]
-    )
-    if tail:
-        print(tail)
-    from hermes_constants import display_hermes_home as _dhh
+        if build_succeeded:
+            if package_snapshot is not None:
+                _best_effort_desktop_cleanup(
+                    lambda: _discard_windows_desktop_snapshot(package_snapshot),
+                    "Desktop recovery snapshot",
+                )
+            _best_effort_desktop_cleanup(
+                lambda: _discard_desktop_build_path(builder_backup),
+                "Desktop builder backup",
+            )
+            print("  ✓ Desktop app up to date")
+            return True
 
-    print(f"  Full build log: {_dhh()}/logs/update.log")
-    return False
+        if package_snapshot is not None:
+            try:
+                _restore_windows_desktop_package(package_snapshot)
+            except Exception as exc:
+                print(f"  ⚠ Could not restore the previous Desktop package: {exc}")
+            else:
+                _best_effort_desktop_cleanup(
+                    lambda: _discard_windows_desktop_snapshot(package_snapshot),
+                    "Desktop recovery snapshot",
+                )
+        _best_effort_desktop_cleanup(
+            lambda: _discard_desktop_build_path(builder_backup),
+            "Desktop builder backup",
+        )
+
+        print("  ⚠ Desktop build failed (non-fatal; run `hermes desktop` to retry)")
+        if build_error is not None:
+            print(f"  {build_error}")
+        elif validation_error is not None:
+            print(f"  {validation_error}")
+        tail = "\n".join(
+            ((build_result.stdout if build_result is not None else "") or "")
+            .strip()
+            .splitlines()[-15:]
+        )
+        if tail:
+            print(tail)
+        from hermes_constants import display_hermes_home as _dhh
+
+        print(f"  Full build log: {_dhh()}/logs/update.log")
+        return False
+    finally:
+        try:
+            _release_desktop_rebuild_lock(rebuild_lock)
+        except Exception as exc:
+            print(f"  ⚠ Could not clean Desktop rebuild lock: {exc}")
 
 
 def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
