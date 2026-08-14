@@ -90,6 +90,30 @@ def _write_recovery_snapshot(project_root, package_bytes):
     return snapshot
 
 
+def _damage_complete_package(package: Path, damage: str) -> None:
+    app_asar = package / "resources" / "app.asar"
+    install_stamp = package / "resources" / "install-stamp.json"
+    if damage == "missing-app-asar":
+        app_asar.unlink()
+    elif damage == "empty-app-asar":
+        app_asar.write_bytes(b"")
+    elif damage == "missing-install-stamp":
+        install_stamp.unlink()
+    elif damage == "empty-install-stamp":
+        install_stamp.write_bytes(b"")
+    elif damage == "invalid-install-stamp":
+        install_stamp.write_text('{"schemaVersion": 999}', encoding="utf-8")
+    elif damage == "invalid-utf8-install-stamp":
+        install_stamp.write_bytes(b"\xff")
+    elif damage == "oversized-install-stamp":
+        encoded = json.dumps(VALID_INSTALL_STAMP).encode("utf-8")
+        install_stamp.write_bytes(encoded + b" " * (65537 - len(encoded)))
+    elif damage == "deeply-nested-install-stamp":
+        install_stamp.write_bytes(b"[" * 2000 + b"0" + b"]" * 2000)
+    else:
+        raise AssertionError(f"unknown package damage: {damage}")
+
+
 def _make_windows_junction(link: Path, target: Path) -> None:
     result = subprocess.run(
         ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
@@ -145,6 +169,44 @@ def _unsafe_ancestor_fixture(tmp_path, monkeypatch, ancestor, create_link):
         update_cmd._m(), "_desktop_build_needed", lambda *a, **k: True
     )
     return project_root, external_live, marker, snapshot
+
+
+def _assert_builder_leaf_link_fails_closed_and_restores(
+    tmp_path, monkeypatch, unsafe_leaf, create_link
+):
+    original = _valid_pe(b"original-package")
+    live = _prepare_rebuild(tmp_path, monkeypatch, original)
+    backup = live.with_name("win-unpacked.bak")
+    outside = tmp_path / "outside-builder-target"
+    outside.mkdir()
+    marker = outside / "marker.bin"
+    marker.write_bytes(b"external-unchanged")
+    calls = []
+
+    def run_pack(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            live.rename(backup)
+            if unsafe_leaf == "live":
+                create_link(live, outside)
+            else:
+                shutil.rmtree(backup)
+                create_link(backup, outside)
+                live.mkdir()
+                (live / "Hermes.exe").write_bytes(b"partial-package")
+        return SimpleNamespace(returncode=1, stdout="failed")
+
+    monkeypatch.setattr(update_cmd._m(), "_run_logged_subprocess", run_pack)
+
+    assert update_cmd._maybe_rebuild_desktop(True) is False
+    assert len(calls) == 1
+    assert marker.read_bytes() == b"external-unchanged"
+    assert sorted(path.name for path in outside.iterdir()) == ["marker.bin"]
+    assert (live / "Hermes.exe").read_bytes() == original
+    assert (live / "resources" / "app.asar").read_bytes() == b"app-asar"
+    assert not os.path.lexists(backup)
+    assert not (_recovery_root(tmp_path) / "snapshot").exists()
+    assert _release_entries(live) == ["win-unpacked"]
 
 
 def test_previously_installed_desktop_rebuilds_when_output_is_missing(tmp_path, monkeypatch):
@@ -438,19 +500,7 @@ def test_orphan_snapshot_restores_package_with_incomplete_resources_before_stamp
 ):
     original = _valid_pe(b"original-package")
     live = _prepare_rebuild(tmp_path, monkeypatch, _valid_pe(b"incomplete-package"))
-    resource = {
-        "missing-app-asar": live / "resources" / "app.asar",
-        "empty-app-asar": live / "resources" / "app.asar",
-        "missing-install-stamp": live / "resources" / "install-stamp.json",
-        "empty-install-stamp": live / "resources" / "install-stamp.json",
-        "invalid-install-stamp": live / "resources" / "install-stamp.json",
-    }[damaged_resource]
-    if damaged_resource.startswith("missing"):
-        resource.unlink()
-    elif damaged_resource == "invalid-install-stamp":
-        resource.write_text('{"schemaVersion": 999}', encoding="utf-8")
-    else:
-        resource.write_bytes(b"")
+    _damage_complete_package(live, damaged_resource)
     snapshot = _write_recovery_snapshot(tmp_path, original)
     monkeypatch.setattr(
         update_cmd._m(), "_desktop_build_needed", lambda *a, **k: False
@@ -466,6 +516,67 @@ def test_orphan_snapshot_restores_package_with_incomplete_resources_before_stamp
         (live / "resources" / "install-stamp.json").read_text(encoding="utf-8")
     ) == VALID_INSTALL_STAMP
     assert not snapshot.exists()
+
+
+@pytest.mark.windows_only
+@pytest.mark.parametrize(
+    "damage",
+    (
+        "missing-app-asar",
+        "empty-app-asar",
+        "missing-install-stamp",
+        "empty-install-stamp",
+        "invalid-install-stamp",
+        "invalid-utf8-install-stamp",
+        "oversized-install-stamp",
+        "deeply-nested-install-stamp",
+    ),
+)
+def test_current_hash_rebuilds_incomplete_package_without_snapshot(
+    tmp_path, monkeypatch, damage
+):
+    new_package = _valid_pe(b"rebuilt-package")
+    live = _prepare_rebuild(tmp_path, monkeypatch, _valid_pe(b"incomplete-package"))
+    _damage_complete_package(live, damage)
+    monkeypatch.setattr(
+        update_cmd._m(), "_desktop_build_needed", lambda *a, **k: False
+    )
+    calls = []
+
+    def run_pack(*args, **kwargs):
+        calls.append(args)
+        return _simulate_pack(
+            live, new_package, returncode=0, complete_package=True
+        )
+
+    monkeypatch.setattr(update_cmd._m(), "_run_logged_subprocess", run_pack)
+
+    assert update_cmd._maybe_rebuild_desktop(True) is True
+    assert len(calls) == 1
+    assert (live / "Hermes.exe").read_bytes() == new_package
+    assert (live / "resources" / "app.asar").read_bytes() == b"app-asar"
+    assert json.loads(
+        (live / "resources" / "install-stamp.json").read_text(encoding="utf-8")
+    ) == VALID_INSTALL_STAMP
+
+
+@pytest.mark.windows_only
+def test_current_hash_skips_complete_package_without_snapshot(tmp_path, monkeypatch):
+    original = _valid_pe(b"complete-package")
+    live = _prepare_rebuild(tmp_path, monkeypatch, original)
+    hash_checks = []
+    monkeypatch.setattr(
+        update_cmd._m(),
+        "_desktop_build_needed",
+        lambda *a, **k: hash_checks.append((a, k)) or False,
+    )
+
+    with patch.object(update_cmd._m(), "_run_logged_subprocess") as run:
+        assert update_cmd._maybe_rebuild_desktop(True) is True
+
+    run.assert_not_called()
+    assert len(hash_checks) == 1
+    assert (live / "Hermes.exe").read_bytes() == original
 
 
 @pytest.mark.require_symlinks
@@ -531,6 +642,29 @@ def test_rebuild_rejects_junction_package_ancestor_without_touching_external_tre
     recovery_root = _recovery_root(project_root)
     assert not (recovery_root / "snapshot.new").exists()
     assert not (recovery_root / "failed-live").exists()
+
+
+@pytest.mark.require_symlinks
+@pytest.mark.parametrize("unsafe_leaf", ("live", "backup"))
+def test_retry_rejects_builder_created_symlink_leaf_and_restores_original(
+    tmp_path, monkeypatch, unsafe_leaf
+):
+    _assert_builder_leaf_link_fails_closed_and_restores(
+        tmp_path,
+        monkeypatch,
+        unsafe_leaf,
+        lambda link, target: link.symlink_to(target, target_is_directory=True),
+    )
+
+
+@pytest.mark.windows_only
+@pytest.mark.parametrize("unsafe_leaf", ("live", "backup"))
+def test_retry_rejects_builder_created_junction_leaf_and_restores_original(
+    tmp_path, monkeypatch, unsafe_leaf
+):
+    _assert_builder_leaf_link_fails_closed_and_restores(
+        tmp_path, monkeypatch, unsafe_leaf, _make_windows_junction
+    )
 
 
 def test_os_rebuild_lock_is_exclusive_and_leftover_file_is_reacquirable(tmp_path):

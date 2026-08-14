@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 _DESKTOP_REBUILD_LOCK_WAIT_SECONDS = 0.75
 _DESKTOP_REBUILD_LOCK_RETRY_SECONDS = 0.025
+_MAX_DESKTOP_INSTALL_STAMP_BYTES = 64 * 1024
 
 
 def _m():
@@ -1358,8 +1359,12 @@ def _safe_nonempty_regular_file(path: Path):
     return info
 
 
-def _read_safe_nonempty_file(path: Path) -> bytes:
+def _read_safe_nonempty_file(path: Path, *, max_bytes: int | None = None) -> bytes:
     info = _safe_nonempty_regular_file(path)
+    if max_bytes is not None and info.st_size > max_bytes:
+        raise _IncompleteWindowsDesktopPackage(
+            f"Windows Desktop package file is too large: {path}"
+        )
     flags = os.O_RDONLY
     flags |= getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_CLOEXEC", 0)
@@ -1428,8 +1433,13 @@ def _validated_windows_desktop_package(path: Path) -> _PayloadManifest:
     _safe_nonempty_regular_file(resources / "app.asar")
     stamp_path = resources / "install-stamp.json"
     try:
-        stamp = json.loads(_read_safe_nonempty_file(stamp_path).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        stamp_bytes = _read_safe_nonempty_file(
+            stamp_path, max_bytes=_MAX_DESKTOP_INSTALL_STAMP_BYTES
+        )
+        stamp = json.loads(stamp_bytes.decode("utf-8"))
+    except _IncompleteWindowsDesktopPackage:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise _IncompleteWindowsDesktopPackage(
             f"Windows Desktop install stamp is invalid: {stamp_path}"
         ) from exc
@@ -1461,6 +1471,49 @@ def _windows_desktop_package_is_valid(path: Path) -> bool:
     except (OSError, ValueError):
         return False
     return True
+
+
+def _validate_desktop_builder_directory_leaf(project_root: Path, path: Path) -> None:
+    info = _validate_safe_project_path(project_root, path, allow_missing=True)
+    if info is not None and not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"Desktop builder path is not a directory: {path}")
+
+
+def _discard_desktop_reparse_leaf(path: Path) -> None:
+    """Remove a builder-owned symlink/reparse leaf without following it."""
+    project_root = _m().PROJECT_ROOT
+    parent = path.parent
+    if _validate_safe_project_path(project_root, parent, allow_missing=True) is None:
+        return
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(info, "st_file_attributes", 0)
+    is_reparse = stat.S_ISLNK(info.st_mode) or (
+        reparse_flag and file_attributes & reparse_flag
+    )
+    if not is_reparse:
+        return
+
+    _validate_safe_project_path(project_root, parent)
+    current = path.lstat()
+    current_attributes = getattr(current, "st_file_attributes", 0)
+    current_is_reparse = stat.S_ISLNK(current.st_mode) or (
+        reparse_flag and current_attributes & reparse_flag
+    )
+    if not current_is_reparse or (current.st_dev, current.st_ino) != (
+        info.st_dev,
+        info.st_ino,
+    ):
+        raise ValueError(f"Desktop builder reparse leaf changed: {path}")
+    if stat.S_ISLNK(current.st_mode):
+        path.unlink()
+    elif stat.S_ISDIR(current.st_mode):
+        os.rmdir(path)
+    else:
+        path.unlink()
 
 
 def _snapshot_windows_desktop_package(desktop_dir: Path):
@@ -1529,8 +1582,10 @@ def _restore_windows_desktop_package(snapshot) -> None:
     project_root = _m().PROJECT_ROOT
     live, preserved, snapshot_root = snapshot
     _validate_safe_project_path(project_root, preserved)
-    _validate_safe_project_path(project_root, live, allow_missing=True)
     manifest = _validated_windows_desktop_package(preserved)
+    _discard_desktop_reparse_leaf(live)
+    _discard_desktop_reparse_leaf(live.with_name("win-unpacked.bak"))
+    _validate_safe_project_path(project_root, live, allow_missing=True)
     recovery_root = snapshot_root.parent
     failed = recovery_root / "failed-live"
     staging = live.with_name("win-unpacked.hermes-recovery-staging")
@@ -1583,7 +1638,7 @@ def _prepare_windows_desktop_recovery(desktop_dir: Path):
     project_root = _m().PROJECT_ROOT
     _validate_safe_project_path(project_root, desktop_dir, allow_missing=True)
     live = desktop_dir / "release" / "win-unpacked"
-    _validate_safe_project_path(project_root, live, allow_missing=True)
+    _validate_safe_project_path(project_root, live.parent, allow_missing=True)
     recovery_root = _ensure_desktop_recovery_root(project_root)
     snapshot_root = recovery_root / "snapshot"
     _validate_safe_project_path(project_root, snapshot_root, allow_missing=True)
@@ -1684,11 +1739,19 @@ def _maybe_rebuild_desktop(was_installed: bool) -> bool:
             return False
 
         print("→ Checking if desktop app needs rebuilding...")
+        live_package = desktop_dir / "release" / "win-unpacked"
         builder_backup = desktop_dir / "release" / "win-unpacked.bak"
         try:
             _validate_safe_project_path(project_root, desktop_dir)
-            skip_desktop_build = not _m()._desktop_build_needed(
-                desktop_dir, project_root, source_mode=False
+            package_is_complete = (
+                sys.platform != "win32"
+                or _windows_desktop_package_is_valid(live_package)
+            )
+            skip_desktop_build = (
+                package_is_complete
+                and not _m()._desktop_build_needed(
+                    desktop_dir, project_root, source_mode=False
+                )
             )
         except Exception:
             skip_desktop_build = False
@@ -1735,15 +1798,20 @@ def _maybe_rebuild_desktop(was_installed: bool) -> bool:
                 _validate_safe_project_path(
                     project_root, desktop_dir / "release", allow_missing=True
                 )
+                _validate_desktop_builder_directory_leaf(
+                    project_root, live_package
+                )
+                _validate_desktop_builder_directory_leaf(
+                    project_root, builder_backup
+                )
                 build_result = _m()._run_logged_subprocess(
                     build_cmd, cwd=project_root, env=build_env
                 )
                 if build_result.returncode != 0:
                     continue
                 if sys.platform == "win32":
-                    live = desktop_dir / "release" / "win-unpacked"
                     try:
-                        _validated_windows_desktop_package(live)
+                        _validated_windows_desktop_package(live_package)
                     except Exception as exc:
                         validation_error = exc
                         continue
