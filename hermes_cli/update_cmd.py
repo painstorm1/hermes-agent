@@ -6556,18 +6556,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # automation / operators do not treat the fleet as healthy.
             sys.exit(1)
 
-    except subprocess.CalledProcessError as e:
-        if _m()._is_windows():
-            print(f"⚠ Git update failed: {e}")
-            print("→ Falling back to ZIP download...")
-            print()
-            _update_via_zip(
-                args,
+    except subprocess.CalledProcessError as error:
+        _handle_update_subprocess_failure(
+            args,
+            error,
+            is_windows=_m()._is_windows(),
+            zip_update=lambda zip_args: _update_via_zip(
+                zip_args,
                 had_desktop_app_before_update=had_desktop_app_before_update,
-            )
-        else:
-            print(f"✗ Update failed: {e}")
-            sys.exit(1)
+            ),
+        )
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
 
@@ -6591,6 +6589,32 @@ def _restart_phase_failure_is_incomplete(surviving, pre_restart_pids) -> bool:
     # surviving == []: safe only if we know nothing was running beforehand.
     return pre_restart_pids is None or bool(pre_restart_pids)
 
+
+def _failed_subprocess_is_git(error: subprocess.CalledProcessError) -> bool:
+    cmd = error.cmd
+    if isinstance(cmd, (list, tuple)):
+        executable = str(cmd[0]) if cmd else ""
+    else:
+        executable = str(cmd).lstrip().split(maxsplit=1)[0].strip('"')
+    command_name = executable.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return command_name in {"git", "git.exe"}
+
+
+def _handle_update_subprocess_failure(
+    args,
+    error: subprocess.CalledProcessError,
+    *,
+    is_windows: bool,
+    zip_update=None,
+) -> None:
+    if is_windows and _failed_subprocess_is_git(error):
+        print(f"⚠ Git update failed: {error}")
+        print("→ Falling back to ZIP download...")
+        print()
+        (zip_update or _update_via_zip)(args)
+        return
+    print(f"✗ Update failed: {error}")
+    raise SystemExit(1)
 
 def _print_items(items, label, key, fallback_key=None):
     if not items:
