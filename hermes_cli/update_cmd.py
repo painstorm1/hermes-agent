@@ -29,6 +29,7 @@ import logging
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time as _time
@@ -737,9 +738,18 @@ def _stage_replacement(
     """
     staging = f"{dst}.hermes-update-staging"
     backup = f"{dst}.hermes-update-old"
+    preserved_payloads = []
     for relative in preserve_relative:
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError(f"unsafe preserved path: {relative}")
+        existing = Path(dst) / relative
+        preserved_payloads.append(
+            (
+                existing,
+                Path(staging) / relative,
+                _validated_payload_manifest(existing),
+            )
+        )
     # A previous run may have died between "move dst aside" and "move staging
     # in" — leaving dst missing and the backup as the ONLY copy of that entry.
     # Restore it before clearing leftovers: deleting the backup first and then
@@ -758,27 +768,78 @@ def _stage_replacement(
             shutil.copytree(src, staging)
         else:
             shutil.copy2(src, staging)
-        for relative in preserve_relative:
-            existing = Path(dst) / relative
-            preserved = Path(staging) / relative
-            if existing.is_dir():
-                preserved.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(existing, preserved)
-            elif existing.is_file():
-                preserved.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(existing, preserved)
+        for existing, preserved, manifest in preserved_payloads:
+            _copy_validated_payload(existing, preserved, manifest)
     except Exception:
         _discard_staged([(staging, dst)])
         raise
     return staging
 
 
+def _safe_payload_lstat(path: Path):
+    info = path.lstat()
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(info, "st_file_attributes", 0)
+    if stat.S_ISLNK(info.st_mode) or (reparse_flag and file_attributes & reparse_flag):
+        raise ValueError(f"unsafe payload symlink or reparse point: {path}")
+    return info
+
+
+def _validated_payload_manifest(
+    path: Path,
+) -> tuple[tuple[Path, ...], tuple[tuple[Path, int], ...]]:
+    try:
+        root_info = _safe_payload_lstat(path)
+    except FileNotFoundError:
+        return (), ()
+
+    if stat.S_ISREG(root_info.st_mode):
+        return (), ((Path(), root_info.st_size),)
+    if not stat.S_ISDIR(root_info.st_mode):
+        return (), ()
+
+    directories = [Path()]
+    files = []
+    pending = [(path, Path())]
+    while pending:
+        directory, relative_directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                entry_path = Path(entry.path)
+                entry_info = _safe_payload_lstat(entry_path)
+                relative = relative_directory / entry.name
+                if stat.S_ISDIR(entry_info.st_mode):
+                    directories.append(relative)
+                    pending.append((entry_path, relative))
+                elif stat.S_ISREG(entry_info.st_mode):
+                    files.append((relative, entry_info.st_size))
+    return tuple(directories), tuple(files)
+
+
+def _copy_validated_payload(
+    source: Path,
+    destination: Path,
+    manifest: tuple[tuple[Path, ...], tuple[tuple[Path, int], ...]],
+) -> None:
+    directories, files = manifest
+    for relative in sorted(directories, key=lambda item: len(item.parts)):
+        source_info = _safe_payload_lstat(source / relative)
+        if not stat.S_ISDIR(source_info.st_mode):
+            raise ValueError(f"preserved payload directory changed: {source / relative}")
+        (destination / relative).mkdir(parents=True, exist_ok=True)
+    for relative, _size in files:
+        source_file = source / relative
+        source_info = _safe_payload_lstat(source_file)
+        if not stat.S_ISREG(source_info.st_mode):
+            raise ValueError(f"preserved payload file changed: {source_file}")
+        target_file = destination / relative
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, target_file, follow_symlinks=False)
+
+
 def _path_payload_size(path: Path) -> int:
-    if path.is_file():
-        return path.stat().st_size
-    if path.is_dir():
-        return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
-    return 0
+    _directories, files = _validated_payload_manifest(path)
+    return sum(size for _relative, size in files)
 
 
 def _zip_staging_size(

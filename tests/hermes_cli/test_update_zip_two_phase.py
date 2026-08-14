@@ -13,6 +13,7 @@ Reference: issues #76104 (ZIP atomicity) and #76105 (venv-helper duplication).
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -549,3 +550,120 @@ def test_zip_staging_cleans_current_entry_when_artifact_copy_fails(
         update_cmd._stage_zip_entries(extracted, live, ["apps"])
 
     assert not [path for path in live.rglob("*") if "hermes-update" in path.name]
+
+
+def _zip_link_fixture(tmp_path):
+    live = tmp_path / "live"
+    extracted = tmp_path / "extracted"
+    outside = tmp_path / "outside"
+    (live / "apps/desktop").mkdir(parents=True)
+    (extracted / "apps/desktop").mkdir(parents=True)
+    (extracted / "apps/desktop/main.ts").write_text("new source")
+    outside.mkdir()
+    (outside / "external.bin").write_bytes(b"outside-payload")
+    return live, extracted, outside
+
+
+@pytest.mark.require_symlinks
+def test_zip_staging_rejects_preserved_root_symlink_before_touching_live(tmp_path):
+    live, extracted, outside = _zip_link_fixture(tmp_path)
+    release = live / "apps/desktop/release"
+    release.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink or reparse point"):
+        update_cmd._stage_zip_entries(extracted, live, ["apps"])
+
+    assert release.is_symlink()
+    assert (outside / "external.bin").read_bytes() == b"outside-payload"
+    assert not (live / "apps/desktop/main.ts").exists()
+    assert not Path(f"{live / 'apps'}.hermes-update-staging").exists()
+    assert not Path(f"{live / 'apps'}.hermes-update-old").exists()
+
+
+@pytest.mark.require_symlinks
+def test_zip_staging_size_rejects_preserved_root_symlink_without_traversal(tmp_path):
+    live, extracted, outside = _zip_link_fixture(tmp_path)
+    (live / "apps/desktop/release").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink or reparse point"):
+        update_cmd._zip_staging_size(extracted, ["apps"], live)
+
+    assert (outside / "external.bin").read_bytes() == b"outside-payload"
+
+
+@pytest.mark.require_symlinks
+def test_zip_staging_rejects_nested_preserved_symlink_before_touching_live(tmp_path):
+    live, extracted, outside = _zip_link_fixture(tmp_path)
+    release = live / "apps/desktop/release"
+    release.mkdir()
+    (release / "Hermes.exe").write_bytes(b"old-exe")
+    linked = release / "linked-assets"
+    linked.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink or reparse point"):
+        update_cmd._stage_zip_entries(extracted, live, ["apps"])
+
+    assert linked.is_symlink()
+    assert (release / "Hermes.exe").read_bytes() == b"old-exe"
+    assert (outside / "external.bin").read_bytes() == b"outside-payload"
+    assert not (live / "apps/desktop/main.ts").exists()
+    assert not Path(f"{live / 'apps'}.hermes-update-staging").exists()
+    assert not Path(f"{live / 'apps'}.hermes-update-old").exists()
+
+
+@pytest.mark.require_symlinks
+def test_zip_staging_size_rejects_nested_preserved_symlink_without_traversal(tmp_path):
+    live, extracted, outside = _zip_link_fixture(tmp_path)
+    release = live / "apps/desktop/release"
+    release.mkdir()
+    (release / "linked-assets").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink or reparse point"):
+        update_cmd._zip_staging_size(extracted, ["apps"], live)
+
+    assert (outside / "external.bin").read_bytes() == b"outside-payload"
+
+
+def _make_windows_junction(link: Path, target: Path) -> None:
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        pytest.skip(
+            "native Windows directory junction creation unavailable via "
+            f"unprivileged mklink /J (exit {result.returncode}): {detail}"
+        )
+
+
+@pytest.mark.windows_only
+def test_zip_staging_rejects_preserved_windows_junction_before_touching_live(
+    tmp_path,
+):
+    live, extracted, outside = _zip_link_fixture(tmp_path)
+    release = live / "apps/desktop/release"
+    _make_windows_junction(release, outside)
+
+    with pytest.raises(ValueError, match="symlink or reparse point"):
+        update_cmd._stage_zip_entries(extracted, live, ["apps"])
+
+    assert release.is_dir()
+    assert (outside / "external.bin").read_bytes() == b"outside-payload"
+    assert not (live / "apps/desktop/main.ts").exists()
+    assert not Path(f"{live / 'apps'}.hermes-update-staging").exists()
+    assert not Path(f"{live / 'apps'}.hermes-update-old").exists()
+
+
+@pytest.mark.windows_only
+def test_zip_staging_size_rejects_preserved_windows_junction_without_traversal(
+    tmp_path,
+):
+    live, extracted, outside = _zip_link_fixture(tmp_path)
+    _make_windows_junction(live / "apps/desktop/release", outside)
+
+    with pytest.raises(ValueError, match="symlink or reparse point"):
+        update_cmd._zip_staging_size(extracted, ["apps"], live)
+
+    assert (outside / "external.bin").read_bytes() == b"outside-payload"
