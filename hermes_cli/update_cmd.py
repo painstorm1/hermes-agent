@@ -1010,6 +1010,71 @@ def _desktop_was_installed(desktop_dir: Path) -> bool:
     )
 
 
+def _snapshot_windows_desktop_package(desktop_dir: Path):
+    """Move the current Windows package outside electron-builder's paths."""
+    import tempfile
+
+    live = desktop_dir / "release" / "win-unpacked"
+    try:
+        live_info = _safe_payload_lstat(live)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(live_info.st_mode):
+        raise ValueError(f"Desktop package path is not a directory: {live}")
+
+    # Validate before moving so cleanup never follows a symlink, junction, or
+    # other reparse point hidden inside the package tree.
+    _validated_payload_manifest(live)
+    snapshot_root = Path(
+        tempfile.mkdtemp(prefix=".hermes-update-desktop-", dir=desktop_dir)
+    )
+    snapshot = snapshot_root / "win-unpacked"
+    try:
+        os.rename(live, snapshot)
+    except Exception:
+        snapshot_root.rmdir()
+        raise
+    return live, snapshot, snapshot_root
+
+
+def _discard_desktop_build_path(path: Path) -> None:
+    """Remove a Desktop build artifact without following reparse points."""
+    try:
+        info = _safe_payload_lstat(path)
+        if stat.S_ISDIR(info.st_mode):
+            _validated_payload_manifest(path)
+            shutil.rmtree(path)
+        elif stat.S_ISREG(info.st_mode):
+            path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _restore_windows_desktop_package(snapshot) -> None:
+    """Atomically put the pre-build Windows package back in its live path."""
+    live, preserved, snapshot_root = snapshot
+    failed = snapshot_root / "failed-build"
+    if os.path.lexists(live):
+        os.rename(live, failed)
+    try:
+        os.rename(preserved, live)
+    except Exception:
+        if not os.path.lexists(live) and os.path.lexists(failed):
+            os.rename(failed, live)
+        raise
+    _discard_desktop_build_path(failed)
+    snapshot_root.rmdir()
+
+
+def _discard_windows_desktop_snapshot(snapshot) -> None:
+    """Remove a no-longer-needed pre-build package snapshot."""
+    if snapshot is None:
+        return
+    _live, preserved, snapshot_root = snapshot
+    _discard_desktop_build_path(preserved)
+    snapshot_root.rmdir()
+
+
 def _maybe_rebuild_desktop(was_installed: bool) -> bool:
     """Rebuild a previously installed Desktop app after a source update."""
     if not was_installed:
@@ -1038,19 +1103,47 @@ def _maybe_rebuild_desktop(was_installed: bool) -> bool:
 
     build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
     build_env = with_hermes_node_path()
-    build_result = _m()._run_logged_subprocess(
-        build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
-    )
-    if build_result.returncode != 0:
+    try:
+        package_snapshot = _snapshot_windows_desktop_package(desktop_dir)
+    except Exception as exc:
+        print(f"  ⚠ Desktop build unavailable: could not preserve previous package ({exc})")
+        return False
+
+    build_error = None
+    build_result = None
+    try:
         build_result = _m()._run_logged_subprocess(
             build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
         )
-    if build_result.returncode == 0:
+        if build_result.returncode != 0:
+            build_result = _m()._run_logged_subprocess(
+                build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
+            )
+    except Exception as exc:
+        build_error = exc
+
+    builder_backup = desktop_dir / "release" / "win-unpacked.bak"
+    if build_result is not None and build_result.returncode == 0:
+        _discard_windows_desktop_snapshot(package_snapshot)
+        _discard_desktop_build_path(builder_backup)
         print("  ✓ Desktop app up to date")
         return True
 
+    if package_snapshot is not None:
+        try:
+            _restore_windows_desktop_package(package_snapshot)
+        except Exception as exc:
+            print(f"  ⚠ Could not restore the previous Desktop package: {exc}")
+    _discard_desktop_build_path(builder_backup)
+
     print("  ⚠ Desktop build failed (non-fatal; run `hermes desktop` to retry)")
-    tail = "\n".join((build_result.stdout or "").strip().splitlines()[-15:])
+    if build_error is not None:
+        print(f"  {build_error}")
+    tail = "\n".join(
+        ((build_result.stdout if build_result is not None else "") or "")
+        .strip()
+        .splitlines()[-15:]
+    )
     if tail:
         print(tail)
     from hermes_constants import display_hermes_home as _dhh
