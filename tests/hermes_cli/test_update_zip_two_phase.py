@@ -496,3 +496,56 @@ def test_zip_staging_size_includes_preserved_desktop_bytes(tmp_path):
     (live / "apps/desktop/release/Hermes.exe").write_bytes(b"123456")
 
     assert update_cmd._zip_staging_size(extracted, ["apps"], live) == 10
+
+
+@pytest.mark.parametrize(
+    "unsafe_relative",
+    [
+        lambda tmp_path: (tmp_path / "outside").resolve(),
+        lambda _tmp_path: Path("..") / "outside",
+    ],
+    ids=["absolute", "parent-traversal"],
+)
+def test_stage_replacement_rejects_unsafe_preserve_before_source_staging(
+    tmp_path, unsafe_relative
+):
+    """Unsafe preserve paths fail before an unavailable source can stage."""
+    live = tmp_path / "live"
+    live.mkdir()
+    destination = live / "apps"
+    staging = Path(f"{destination}.hermes-update-staging")
+
+    with pytest.raises(ValueError, match="unsafe preserved path"):
+        update_cmd._stage_replacement(
+            str(tmp_path / "missing-source"),
+            str(destination),
+            preserve_relative=(unsafe_relative(tmp_path),),
+        )
+
+    assert not staging.exists()
+
+
+def test_zip_staging_cleans_current_entry_when_artifact_copy_fails(
+    tmp_path, monkeypatch
+):
+    """A preserved artifact copy failure leaves no current staging directory."""
+    live = tmp_path / "live"
+    extracted = tmp_path / "extracted"
+    (extracted / "apps/desktop").mkdir(parents=True)
+    (extracted / "apps/desktop/main.ts").write_text("new")
+    (live / "apps/desktop/release").mkdir(parents=True)
+    (live / "apps/desktop/release/Hermes.exe").write_bytes(b"old")
+    real_copytree = update_cmd.shutil.copytree
+    calls = {"count": 0}
+
+    def fail_preserved_copy(src, dst, *args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("simulated preserved artifact copy failure")
+        return real_copytree(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(update_cmd.shutil, "copytree", fail_preserved_copy)
+    with pytest.raises(OSError, match="preserved artifact copy failure"):
+        update_cmd._stage_zip_entries(extracted, live, ["apps"])
+
+    assert not [path for path in live.rglob("*") if "hermes-update" in path.name]

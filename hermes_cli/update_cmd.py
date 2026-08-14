@@ -737,6 +737,9 @@ def _stage_replacement(
     """
     staging = f"{dst}.hermes-update-staging"
     backup = f"{dst}.hermes-update-old"
+    for relative in preserve_relative:
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"unsafe preserved path: {relative}")
     # A previous run may have died between "move dst aside" and "move staging
     # in" — leaving dst missing and the backup as the ONLY copy of that entry.
     # Restore it before clearing leftovers: deleting the backup first and then
@@ -750,21 +753,23 @@ def _stage_replacement(
             shutil.rmtree(leftover, ignore_errors=True)
         elif os.path.exists(leftover):
             os.remove(leftover)
-    if os.path.isdir(src):
-        shutil.copytree(src, staging)
-    else:
-        shutil.copy2(src, staging)
-    for relative in preserve_relative:
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError(f"unsafe preserved path: {relative}")
-        existing = Path(dst) / relative
-        preserved = Path(staging) / relative
-        if existing.is_dir():
-            preserved.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(existing, preserved)
-        elif existing.is_file():
-            preserved.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(existing, preserved)
+    try:
+        if os.path.isdir(src):
+            shutil.copytree(src, staging)
+        else:
+            shutil.copy2(src, staging)
+        for relative in preserve_relative:
+            existing = Path(dst) / relative
+            preserved = Path(staging) / relative
+            if existing.is_dir():
+                preserved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(existing, preserved)
+            elif existing.is_file():
+                preserved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(existing, preserved)
+    except Exception:
+        _discard_staged([(staging, dst)])
+        raise
     return staging
 
 
