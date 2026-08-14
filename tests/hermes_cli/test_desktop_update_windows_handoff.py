@@ -36,6 +36,7 @@ def test_windows_handoff_runs_update_without_locking_shim_and_validates_relaunch
         "main",
     ]
     assert calls[0]["shim_replaceable"] is True
+    assert calls[0]["cwd"] == str(tmp_path / "hermes-agent")
     assert calls[1]["argv"] == ["desktop", "--build-only"]
     assert relaunch.exists()
 
@@ -56,8 +57,28 @@ def test_windows_handoff_reports_failure_after_validation_build_and_single_retry
     assert result["ok"] is False
 
 
+@pytest.mark.windows_only
+def test_windows_handoff_retries_once_when_validation_build_does_not_create_relaunch(
+    tmp_path: Path,
+) -> None:
+    """A missing requested executable makes the otherwise-successful build fail."""
+    completed, calls, relaunch, result = run_windows_handoff(
+        tmp_path, skip_relaunch=True
+    )
+
+    assert completed.returncode == 6
+    assert not relaunch.exists()
+    assert [call["argv"] for call in calls] == [
+        ["update", "--yes", "--gateway", "--force", "--branch", "main"],
+        ["desktop", "--build-only"],
+        ["desktop", "--force-build", "--build-only"],
+    ]
+    assert len(calls) == 3
+    assert result["ok"] is False
+
+
 def run_windows_handoff(
-    tmp_path: Path, *, build_fail: bool = False
+    tmp_path: Path, *, build_fail: bool = False, skip_relaunch: bool = False
 ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]], Path, dict[str, object]]:
     """Run the real handoff script against a disposable venv and fake CLI module."""
     install_root = tmp_path / "hermes-agent"
@@ -94,8 +115,10 @@ def main():
             unlocked = True
         except PermissionError:
             unlocked = False
-    calls.append({"argv": sys.argv[1:], "shim_replaceable": unlocked})
+    calls.append({"argv": sys.argv[1:], "shim_replaceable": unlocked, "cwd": os.getcwd()})
     record.write_text(json.dumps(calls))
+    if os.environ.get("HERMES_HANDOFF_SKIP_RELAUNCH") == "1":
+        raise SystemExit(0)
     if sys.argv[1] == "desktop" and os.environ.get("HERMES_HANDOFF_BUILD_FAIL") != "1":
         Path(os.environ["HERMES_HANDOFF_RELAUNCH"]).write_bytes(b"fake-pe")
     if sys.argv[1] == "desktop" and os.environ.get("HERMES_HANDOFF_BUILD_FAIL") == "1":
@@ -116,6 +139,7 @@ if __name__ == "__main__":
     env.update(
         {
             "PYTHONPATH": str(fake_root),
+            "SystemDrive": env.get("SystemDrive", "C:"),
             "HERMES_HANDOFF_RECORD": str(record),
             "HERMES_HANDOFF_SHIM": str(shim),
             "HERMES_HANDOFF_RELAUNCH": str(relaunch),
@@ -123,6 +147,8 @@ if __name__ == "__main__":
     )
     if build_fail:
         env["HERMES_HANDOFF_BUILD_FAIL"] = "1"
+    if skip_relaunch:
+        env["HERMES_HANDOFF_SKIP_RELAUNCH"] = "1"
 
     completed = subprocess.run(
         [
