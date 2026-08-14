@@ -535,21 +535,114 @@ def test_zip_staging_cleans_current_entry_when_artifact_copy_fails(
     (extracted / "apps/desktop").mkdir(parents=True)
     (extracted / "apps/desktop/main.ts").write_text("new")
     (live / "apps/desktop/release").mkdir(parents=True)
-    (live / "apps/desktop/release/Hermes.exe").write_bytes(b"old")
-    real_copytree = update_cmd.shutil.copytree
-    calls = {"count": 0}
+    preserved_file = live / "apps/desktop/release/Hermes.exe"
+    preserved_file.write_bytes(b"old")
+    real_open = update_cmd.os.open
 
-    def fail_preserved_copy(src, dst, *args, **kwargs):
-        calls["count"] += 1
-        if calls["count"] == 2:
-            raise OSError("simulated preserved artifact copy failure")
-        return real_copytree(src, dst, *args, **kwargs)
+    def fail_preserved_open(path, *args, **kwargs):
+        if Path(path) == preserved_file:
+            raise OSError("simulated preserved artifact open failure")
+        return real_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(update_cmd.shutil, "copytree", fail_preserved_copy)
-    with pytest.raises(OSError, match="preserved artifact copy failure"):
+    monkeypatch.setattr(update_cmd.os, "open", fail_preserved_open)
+    with pytest.raises(OSError, match="preserved artifact open failure"):
         update_cmd._stage_zip_entries(extracted, live, ["apps"])
 
     assert not [path for path in live.rglob("*") if "hermes-update" in path.name]
+
+
+def test_zip_preservation_plan_is_scanned_once_and_shared_by_size_and_copy(
+    tmp_path, monkeypatch
+):
+    live = tmp_path / "live"
+    extracted = tmp_path / "extracted"
+    (extracted / "apps").mkdir(parents=True)
+    (extracted / "apps/source.txt").write_bytes(b"1234")
+    release = live / "apps/desktop/release"
+    release.mkdir(parents=True)
+    (release / "Hermes.exe").write_bytes(b"123456")
+    scan_paths = []
+    copied_manifests = []
+    real_scan = update_cmd._validated_payload_manifest
+    real_copy = update_cmd._copy_validated_payload
+
+    def track_scan(path):
+        scan_paths.append(Path(path))
+        return real_scan(path)
+
+    def track_copy(source, destination, manifest):
+        copied_manifests.append(manifest)
+        return real_copy(source, destination, manifest)
+
+    monkeypatch.setattr(update_cmd, "_validated_payload_manifest", track_scan)
+    monkeypatch.setattr(update_cmd, "_copy_validated_payload", track_copy)
+
+    plan = update_cmd._build_zip_preservation_plan(live, ["apps"])
+    assert (
+        update_cmd._zip_staging_size(
+            extracted, ["apps"], live, preservation_plan=plan
+        )
+        == 10
+    )
+    staged = update_cmd._stage_zip_entries(
+        extracted, live, ["apps"], preservation_plan=plan
+    )
+
+    assert scan_paths.count(release) == 1
+    assert len(plan.artifacts) == 1
+    assert copied_manifests[0] is plan.artifacts[0].manifest
+    update_cmd._discard_staged(staged)
+
+
+def test_zip_stage_rejects_same_size_file_swap_after_planning(tmp_path):
+    live = tmp_path / "live"
+    extracted = tmp_path / "extracted"
+    (extracted / "apps/desktop").mkdir(parents=True)
+    (extracted / "apps/desktop/main.ts").write_text("new")
+    release = live / "apps/desktop/release"
+    release.mkdir(parents=True)
+    preserved_file = release / "Hermes.exe"
+    preserved_file.write_bytes(b"old-safe")
+    replacement = tmp_path / "external.exe"
+    replacement.write_bytes(b"evil-bad")
+    plan = update_cmd._build_zip_preservation_plan(live, ["apps"])
+    os.replace(replacement, preserved_file)
+
+    with pytest.raises(ValueError, match="changed since planning"):
+        update_cmd._stage_zip_entries(
+            extracted, live, ["apps"], preservation_plan=plan
+        )
+
+    assert preserved_file.read_bytes() == b"evil-bad"
+    assert not (live / "apps/desktop/main.ts").exists()
+    assert not Path(f"{live / 'apps'}.hermes-update-staging").exists()
+
+
+def test_zip_stage_rejects_post_copy_manifest_mismatch(tmp_path, monkeypatch):
+    live = tmp_path / "live"
+    extracted = tmp_path / "extracted"
+    (extracted / "apps/desktop").mkdir(parents=True)
+    (extracted / "apps/desktop/main.ts").write_text("new")
+    release = live / "apps/desktop/release"
+    release.mkdir(parents=True)
+    (release / "Hermes.exe").write_bytes(b"old")
+    plan = update_cmd._build_zip_preservation_plan(live, ["apps"])
+
+    def copy_with_unplanned_file(source, destination, planned_file):
+        destination.write_bytes(source.read_bytes())
+        (destination.parent / "unexpected.bin").write_bytes(b"unexpected")
+
+    monkeypatch.setattr(
+        update_cmd, "_copy_planned_file", copy_with_unplanned_file, raising=False
+    )
+
+    with pytest.raises(ValueError, match="staged payload does not match plan"):
+        update_cmd._stage_zip_entries(
+            extracted, live, ["apps"], preservation_plan=plan
+        )
+
+    assert not (live / "apps/desktop/main.ts").exists()
+    assert not Path(f"{live / 'apps'}.hermes-update-staging").exists()
 
 
 def _zip_link_fixture(tmp_path):
@@ -667,3 +760,30 @@ def test_zip_staging_size_rejects_preserved_windows_junction_without_traversal(
         update_cmd._zip_staging_size(extracted, ["apps"], live)
 
     assert (outside / "external.bin").read_bytes() == b"outside-payload"
+
+
+@pytest.mark.windows_only
+def test_zip_stage_rejects_parent_junction_swap_after_planning(tmp_path):
+    live = tmp_path / "live"
+    extracted = tmp_path / "extracted"
+    (extracted / "apps/desktop").mkdir(parents=True)
+    (extracted / "apps/desktop/main.ts").write_text("new")
+    release = live / "apps/desktop/release"
+    release.mkdir(parents=True)
+    (release / "Hermes.exe").write_bytes(b"old-safe")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "Hermes.exe").write_bytes(b"evil-bad")
+    plan = update_cmd._build_zip_preservation_plan(live, ["apps"])
+    original_release = live / "apps/desktop/release-before-swap"
+    release.rename(original_release)
+    _make_windows_junction(release, outside)
+
+    with pytest.raises(ValueError, match="symlink or reparse point"):
+        update_cmd._stage_zip_entries(
+            extracted, live, ["apps"], preservation_plan=plan
+        )
+
+    assert (outside / "Hermes.exe").read_bytes() == b"evil-bad"
+    assert not (live / "apps/desktop/main.ts").exists()
+    assert not Path(f"{live / 'apps'}.hermes-update-staging").exists()

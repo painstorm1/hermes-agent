@@ -33,6 +33,7 @@ import stat
 import subprocess
 import sys
 import time as _time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -66,6 +67,36 @@ _ZIP_PRESERVED_APPS_PATHS = (
     Path("desktop") / "release",
     Path("desktop") / "dist",
 )
+
+
+@dataclass(frozen=True)
+class _PayloadEntryPlan:
+    relative: Path
+    kind: str
+    size: int
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _PayloadManifest:
+    entries: tuple[_PayloadEntryPlan, ...]
+
+    @property
+    def size(self) -> int:
+        return sum(entry.size for entry in self.entries if entry.kind == "file")
+
+
+@dataclass(frozen=True)
+class _PreservedArtifactPlan:
+    relative: Path
+    source: Path
+    manifest: _PayloadManifest
+
+
+@dataclass(frozen=True)
+class _ZipPreservationPlan:
+    artifacts: tuple[_PreservedArtifactPlan, ...]
 
 
 def _reload_updated_runtime_modules() -> None:
@@ -728,7 +759,11 @@ def _atomic_replace_dir(src: str, dst: str) -> None:
 
 
 def _stage_replacement(
-    src: str, dst: str, *, preserve_relative: tuple[Path, ...] = ()
+    src: str,
+    dst: str,
+    *,
+    preserve_relative: tuple[Path, ...] = (),
+    preservation_artifacts: tuple[_PreservedArtifactPlan, ...] | None = None,
 ) -> str:
     """Copy *src* to a sibling staging path for *dst*; return the staging path.
 
@@ -738,18 +773,21 @@ def _stage_replacement(
     """
     staging = f"{dst}.hermes-update-staging"
     backup = f"{dst}.hermes-update-old"
-    preserved_payloads = []
-    for relative in preserve_relative:
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError(f"unsafe preserved path: {relative}")
-        existing = Path(dst) / relative
-        preserved_payloads.append(
-            (
-                existing,
-                Path(staging) / relative,
-                _validated_payload_manifest(existing),
-            )
-        )
+    if preservation_artifacts is not None and preserve_relative:
+        raise ValueError("pass preserved paths or a preservation plan, not both")
+    if preservation_artifacts is None:
+        planned = []
+        for relative in preserve_relative:
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"unsafe preserved path: {relative}")
+            existing = Path(dst) / relative
+            manifest = _validated_payload_manifest(existing)
+            if manifest.entries:
+                planned.append(_PreservedArtifactPlan(relative, existing, manifest))
+        preservation_artifacts = tuple(planned)
+    for artifact in preservation_artifacts:
+        if artifact.source != Path(dst) / artifact.relative:
+            raise ValueError(f"preservation plan does not match destination: {artifact.source}")
     # A previous run may have died between "move dst aside" and "move staging
     # in" — leaving dst missing and the backup as the ONLY copy of that entry.
     # Restore it before clearing leftovers: deleting the backup first and then
@@ -768,8 +806,12 @@ def _stage_replacement(
             shutil.copytree(src, staging)
         else:
             shutil.copy2(src, staging)
-        for existing, preserved, manifest in preserved_payloads:
-            _copy_validated_payload(existing, preserved, manifest)
+        for artifact in preservation_artifacts:
+            _copy_validated_payload(
+                artifact.source,
+                Path(staging) / artifact.relative,
+                artifact.manifest,
+            )
     except Exception:
         _discard_staged([(staging, dst)])
         raise
@@ -785,21 +827,34 @@ def _safe_payload_lstat(path: Path):
     return info
 
 
-def _validated_payload_manifest(
-    path: Path,
-) -> tuple[tuple[Path, ...], tuple[tuple[Path, int], ...]]:
+def _payload_entry_plan(relative: Path, info, path: Path) -> _PayloadEntryPlan:
+    if stat.S_ISDIR(info.st_mode):
+        kind = "directory"
+        size = 0
+    elif stat.S_ISREG(info.st_mode):
+        kind = "file"
+        size = info.st_size
+    else:
+        raise ValueError(f"unsupported preserved payload type: {path}")
+    return _PayloadEntryPlan(
+        relative=relative,
+        kind=kind,
+        size=size,
+        device=info.st_dev,
+        inode=info.st_ino,
+    )
+
+
+def _validated_payload_manifest(path: Path) -> _PayloadManifest:
     try:
         root_info = _safe_payload_lstat(path)
     except FileNotFoundError:
-        return (), ()
+        return _PayloadManifest(())
 
-    if stat.S_ISREG(root_info.st_mode):
-        return (), ((Path(), root_info.st_size),)
+    planned = [_payload_entry_plan(Path(), root_info, path)]
     if not stat.S_ISDIR(root_info.st_mode):
-        return (), ()
+        return _PayloadManifest(tuple(planned))
 
-    directories = [Path()]
-    files = []
     pending = [(path, Path())]
     while pending:
         directory, relative_directory = pending.pop()
@@ -808,48 +863,159 @@ def _validated_payload_manifest(
                 entry_path = Path(entry.path)
                 entry_info = _safe_payload_lstat(entry_path)
                 relative = relative_directory / entry.name
+                planned.append(_payload_entry_plan(relative, entry_info, entry_path))
                 if stat.S_ISDIR(entry_info.st_mode):
-                    directories.append(relative)
                     pending.append((entry_path, relative))
-                elif stat.S_ISREG(entry_info.st_mode):
-                    files.append((relative, entry_info.st_size))
-    return tuple(directories), tuple(files)
+    planned.sort(key=lambda entry: (len(entry.relative.parts), entry.relative.as_posix()))
+    return _PayloadManifest(tuple(planned))
+
+
+def _assert_planned_identity(
+    planned: _PayloadEntryPlan, info, path: Path
+) -> None:
+    actual = _payload_entry_plan(planned.relative, info, path)
+    identity_changed = (actual.device, actual.inode) != (
+        planned.device,
+        planned.inode,
+    )
+    size_changed = planned.kind == "file" and actual.size != planned.size
+    if actual.kind != planned.kind or identity_changed or size_changed:
+        raise ValueError(f"preserved payload changed since planning: {path}")
+
+
+def _revalidate_file_ancestors(
+    source: Path,
+    relative: Path,
+    entries_by_relative: dict[Path, _PayloadEntryPlan],
+) -> None:
+    current_relative = Path()
+    root_plan = entries_by_relative.get(current_relative)
+    if root_plan is None or root_plan.kind != "directory":
+        if relative.parts:
+            raise ValueError(f"preserved payload parent changed since planning: {source}")
+        return
+    _assert_planned_identity(root_plan, _safe_payload_lstat(source), source)
+    for part in relative.parts[:-1]:
+        current_relative /= part
+        planned = entries_by_relative.get(current_relative)
+        current = source / current_relative
+        if planned is None or planned.kind != "directory":
+            raise ValueError(f"preserved payload parent changed since planning: {current}")
+        _assert_planned_identity(planned, _safe_payload_lstat(current), current)
+
+
+def _copy_planned_file(
+    source: Path, destination: Path, planned: _PayloadEntryPlan
+) -> None:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    try:
+        opened_info = os.fstat(descriptor)
+        _assert_planned_identity(planned, opened_info, source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with os.fdopen(descriptor, "rb", closefd=True) as source_handle:
+            descriptor = -1
+            with open(destination, "wb") as destination_handle:
+                remaining = planned.size
+                while remaining:
+                    chunk = source_handle.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError(
+                            f"preserved payload changed since planning: {source}"
+                        )
+                    destination_handle.write(chunk)
+                    remaining -= len(chunk)
+                if source_handle.read(1):
+                    raise ValueError(
+                        f"preserved payload changed since planning: {source}"
+                    )
+            _assert_planned_identity(
+                planned, os.fstat(source_handle.fileno()), source
+            )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _manifest_shape(manifest: _PayloadManifest):
+    return tuple(
+        (entry.relative, entry.kind, entry.size)
+        for entry in manifest.entries
+    )
 
 
 def _copy_validated_payload(
     source: Path,
     destination: Path,
-    manifest: tuple[tuple[Path, ...], tuple[tuple[Path, int], ...]],
+    manifest: _PayloadManifest,
 ) -> None:
-    directories, files = manifest
-    for relative in sorted(directories, key=lambda item: len(item.parts)):
-        source_info = _safe_payload_lstat(source / relative)
-        if not stat.S_ISDIR(source_info.st_mode):
-            raise ValueError(f"preserved payload directory changed: {source / relative}")
-        (destination / relative).mkdir(parents=True, exist_ok=True)
-    for relative, _size in files:
-        source_file = source / relative
-        source_info = _safe_payload_lstat(source_file)
-        if not stat.S_ISREG(source_info.st_mode):
-            raise ValueError(f"preserved payload file changed: {source_file}")
-        target_file = destination / relative
-        target_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_file, target_file, follow_symlinks=False)
+    entries_by_relative = {
+        entry.relative: entry for entry in manifest.entries
+    }
+    directories = [
+        entry for entry in manifest.entries if entry.kind == "directory"
+    ]
+    files = [entry for entry in manifest.entries if entry.kind == "file"]
+    for planned in directories:
+        source_directory = source / planned.relative
+        _assert_planned_identity(
+            planned,
+            _safe_payload_lstat(source_directory),
+            source_directory,
+        )
+        (destination / planned.relative).mkdir(parents=True, exist_ok=True)
+    for planned in files:
+        _revalidate_file_ancestors(
+            source, planned.relative, entries_by_relative
+        )
+        _copy_planned_file(
+            source / planned.relative,
+            destination / planned.relative,
+            planned,
+        )
+
+    staged_manifest = _validated_payload_manifest(destination)
+    if _manifest_shape(staged_manifest) != _manifest_shape(manifest):
+        raise ValueError(
+            f"staged payload does not match plan: {destination}"
+        )
 
 
 def _path_payload_size(path: Path) -> int:
-    _directories, files = _validated_payload_manifest(path)
-    return sum(size for _relative, size in files)
+    return _validated_payload_manifest(path).size
+
+
+def _build_zip_preservation_plan(
+    project_root: Path, entries: list[str]
+) -> _ZipPreservationPlan:
+    if "apps" not in entries:
+        return _ZipPreservationPlan(())
+    artifacts = []
+    for relative in _ZIP_PRESERVED_APPS_PATHS:
+        source = project_root / "apps" / relative
+        manifest = _validated_payload_manifest(source)
+        if manifest.entries:
+            artifacts.append(
+                _PreservedArtifactPlan(relative, source, manifest)
+            )
+    return _ZipPreservationPlan(tuple(artifacts))
 
 
 def _zip_staging_size(
-    extracted_root: Path, entries: list[str], project_root: Path
+    extracted_root: Path,
+    entries: list[str],
+    project_root: Path,
+    *,
+    preservation_plan: _ZipPreservationPlan | None = None,
 ) -> int:
+    if preservation_plan is None:
+        preservation_plan = _build_zip_preservation_plan(project_root, entries)
     source_bytes = sum(_path_payload_size(extracted_root / entry) for entry in entries)
     preserved_bytes = sum(
-        _path_payload_size(project_root / "apps" / relative)
-        for relative in _ZIP_PRESERVED_APPS_PATHS
-        if "apps" in entries
+        artifact.manifest.size for artifact in preservation_plan.artifacts
     )
     return source_bytes + preserved_bytes
 
@@ -874,18 +1040,24 @@ def _discard_staged(staged) -> None:
 
 
 def _stage_zip_entries(
-    extracted_root: Path, project_root: Path, entries: list[str]
+    extracted_root: Path,
+    project_root: Path,
+    entries: list[str],
+    *,
+    preservation_plan: _ZipPreservationPlan | None = None,
 ) -> list[tuple[str, str]]:
+    if preservation_plan is None:
+        preservation_plan = _build_zip_preservation_plan(project_root, entries)
     staged = []
     try:
         for item in entries:
-            preserve = _ZIP_PRESERVED_APPS_PATHS if item == "apps" else ()
+            artifacts = preservation_plan.artifacts if item == "apps" else ()
             src = extracted_root / item
             dst = project_root / item
             staged.append(
                 (
                     _stage_replacement(
-                        str(src), str(dst), preserve_relative=preserve
+                        str(src), str(dst), preservation_artifacts=artifacts
                     ),
                     str(dst),
                 )
@@ -1253,7 +1425,15 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
         #
         # Staging costs one extra copy of the tree on disk. Check up front so
         # we fail with a clear message instead of running out mid-copy.
-        need = _zip_staging_size(Path(extracted), entries, _m().PROJECT_ROOT)
+        preservation_plan = _build_zip_preservation_plan(
+            _m().PROJECT_ROOT, entries
+        )
+        need = _zip_staging_size(
+            Path(extracted),
+            entries,
+            _m().PROJECT_ROOT,
+            preservation_plan=preservation_plan,
+        )
         # Only the staging copy is new — the live tree already occupies its
         # space and the swaps are renames, not copies. Ask for the staging
         # copy plus 20% headroom rather than a full 2x, which would block
@@ -1268,7 +1448,12 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
                 f"{free // (1024 * 1024)} MB)"
             )
 
-        staged = _stage_zip_entries(Path(extracted), _m().PROJECT_ROOT, entries)
+        staged = _stage_zip_entries(
+            Path(extracted),
+            _m().PROJECT_ROOT,
+            entries,
+            preservation_plan=preservation_plan,
+        )
 
         try:
             _commit_staged_replacements(staged)
