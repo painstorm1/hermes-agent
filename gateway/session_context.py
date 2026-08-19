@@ -112,21 +112,21 @@ _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
-# True  — long-lived CLI sessions (in-process completion_queue drain) and the
-#         real gateway platforms (Telegram/Discord/Slack/...), which hold a
-#         persistent outbound channel and run the watcher/drain loops.
+# True  — long-lived interactive CLI sessions (in-process completion_queue
+#         drain) and the real gateway platforms (Telegram/Discord/Slack/...),
+#         which hold a persistent outbound channel and run the watcher/drain loops.
 # False — finite runtimes that can end before a detached completion returns:
-#         stateless API-server requests and dispatcher-spawned Kanban workers.
+#         stateless API-server requests, single-query CLI runs, and
+#         dispatcher-spawned Kanban workers.
 #
 # Tools that promise async delivery (terminal notify_on_complete /
 # watch_patterns, delegate_task background=True) read this via
 # ``async_delivery_supported()`` and refuse to hand out a promise the channel
 # can't keep — turning a silent no-op into an explicit contract.
 #
-# Default _UNSET => treated as supported, so CLI (which never sets a platform)
-# and any contextvar-unaware path keep working. Stateless adapters opt OUT by
-# setting ``supports_async_delivery = False`` on the adapter class; the gateway
-# propagates that into this contextvar at session-bind time.
+# Default _UNSET => treated as supported, so the interactive CLI (which never
+# sets a platform) and any contextvar-unaware path keep working. Finite CLI
+# runners and stateless adapters opt OUT before executing a turn.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
@@ -486,10 +486,10 @@ def async_delivery_supported() -> bool:
     is delivered: sessions explicitly bound by a stateless channel — an adapter
     that cannot route a notification back after the turn ends (the API server),
     or a one-shot runner that exits after its final response (``hermes -z``,
-    cron — see :func:`declare_stateless_channel`) — and dispatcher-spawned
-    Kanban workers (identified by ``HERMES_KANBAN_TASK``), which are one-shot
-    ``chat -q`` subprocesses. The real gateway platforms, the interactive CLI,
-    and any other path that never bound the contextvar return ``True``.
+    ``hermes chat -q``, cron — see :func:`declare_stateless_channel`) — and
+    dispatcher-spawned Kanban workers (identified by ``HERMES_KANBAN_TASK``).
+    The real gateway platforms, the interactive CLI, and any other path that
+    never bound the contextvar return ``True``.
 
     Tools that promise async delivery (``terminal`` notify_on_complete /
     watch_patterns, ``delegate_task`` background=True) consult this before
