@@ -15,6 +15,7 @@ from agent.turn_retry_state import TurnRetryState
 
 EXPECTED_FIELDS = {
     "codex_auth_retry_attempted",
+    "codex_cache_capability_retry_attempted",
     "anthropic_auth_retry_attempted",
     "nous_auth_retry_attempted",
     "nous_paid_entitlement_refresh_attempted",
@@ -89,3 +90,13 @@ def test_copilot_provider_check_accepts_alias_spellings():
 
     # Fallback path when the agent object lacks the method entirely.
     assert _is_copilot_provider(_NoMethod())
+
+
+def test_codex_cache_capability_error_is_narrowly_detected():
+    from agent.conversation_loop import _is_codex_cache_capability_error
+
+    exact = "prompt_cache_retention is not supported on this model"
+    assert _is_codex_cache_capability_error(400, exact)
+    assert _is_codex_cache_capability_error(None, f"Error code: 400 - {exact}")
+    assert not _is_codex_cache_capability_error(500, exact)
+    assert not _is_codex_cache_capability_error(400, "unknown parameter: temperature")
