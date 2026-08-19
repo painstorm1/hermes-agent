@@ -389,6 +389,25 @@ def _is_stale_copilot_credential_error(status_code: Optional[int], error_message
     )
 
 
+def _is_codex_cache_capability_error(
+    status_code: Optional[int], error_message: str
+) -> bool:
+    """Detect chatgpt.com Codex's transient prompt-cache capability 400.
+
+    During model rollouts the backend can report that
+    ``prompt_cache_retention`` is unsupported even when the outgoing request
+    contains no such field. The same request shape succeeds immediately before
+    and after the error, so aborting as a generic non-retryable 400 strands the
+    user's turn. Keep the match exact; genuinely invalid requests must still
+    fail without a retry loop.
+    """
+    lowered = (error_message or "").lower()
+    is_400 = status_code == 400 or "error code: 400" in lowered
+    return is_400 and (
+        "prompt_cache_retention is not supported on this model" in lowered
+    )
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -5870,6 +5889,25 @@ def run_conversation(
                 ) and not is_context_length_error
 
                 if is_client_error:
+                    # The chatgpt.com Codex backend can intermittently return
+                    # this exact 400 during model rollouts even though the wire
+                    # body contains no prompt_cache_retention field. Identical
+                    # requests around the failure succeed, so retry once before
+                    # treating it as a terminal client error.
+                    if (
+                        agent.api_mode == "codex_responses"
+                        and agent.provider == "openai-codex"
+                        and not _retry.codex_cache_capability_retry_attempted
+                        and _is_codex_cache_capability_error(
+                            status_code,
+                            str(getattr(api_error, "message", "") or api_error),
+                        )
+                    ):
+                        _retry.codex_cache_capability_retry_attempted = True
+                        agent._buffer_vprint(
+                            "♻️ Codex cache capability rollout mismatch; retrying request once..."
+                        )
+                        continue
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
                     # ``model_not_available_for_integrator`` /

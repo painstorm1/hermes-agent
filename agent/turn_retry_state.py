@@ -41,6 +41,10 @@ class TurnRetryState:
 
     # ── Per-provider OAuth / credential refresh guards ───────────────────
     codex_auth_retry_attempted: bool = False
+    # chatgpt.com can intermittently reject an otherwise-valid Codex request
+    # with a stale prompt-cache capability error during model rollouts. Retry
+    # that exact 400 once instead of aborting the whole turn.
+    codex_cache_capability_retry_attempted: bool = False
     anthropic_auth_retry_attempted: bool = False
     nous_auth_retry_attempted: bool = False
     nous_paid_entitlement_refresh_attempted: bool = False
