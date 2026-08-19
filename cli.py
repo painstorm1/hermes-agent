@@ -20536,6 +20536,15 @@ def main(
         os.environ["HERMES_SINGLE_QUERY_SESSION"] = "1"
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
+        # This process exits after the one turn below, so it cannot own detached
+        # work whose completion arrives later. Scope async delivery off for the
+        # whole turn: cronjob(action="run") and delegate_task then use their
+        # synchronous fallback instead of losing a daemon worker at CLI exit.
+        # Use the capability ContextVar directly so this remains scoped and does
+        # not engage the full gateway session-context machinery.
+        from gateway.session_context import _SESSION_ASYNC_DELIVERY
+
+        _async_delivery_token = _SESSION_ASYNC_DELIVERY.set(False)
         try:
             query, single_query_images = _collect_query_images(query, image)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
@@ -20754,7 +20763,10 @@ def main(
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
         finally:
-            _finalize_single_query(cli)
+            try:
+                _finalize_single_query(cli)
+            finally:
+                _SESSION_ASYNC_DELIVERY.reset(_async_delivery_token)
         return
     
     # Run interactive mode
