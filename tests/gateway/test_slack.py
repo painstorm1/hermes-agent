@@ -4224,6 +4224,74 @@ class TestEnsureDmConversation:
         assert post_kwargs["channel"] == "D999NEW"
 
 
+class TestRichBlockContextDeduplication:
+    @staticmethod
+    def _production_message(adapter):
+        adapter.config.extra["rich_blocks"] = True
+        authored = (
+            "- **실패:\u200b** tool 호출 실패\n"
+            "- **성공:** 복구 완료"
+        )
+        fallback = adapter.format_message(authored)
+        blocks = adapter._maybe_blocks(authored)
+        assert blocks
+        return fallback, blocks
+
+    def test_render_message_text_dedupes_formatted_rich_block_bullets(self, adapter):
+        fallback, blocks = self._production_message(adapter)
+
+        rendered = adapter._render_message_text({"text": fallback, "blocks": blocks})
+
+        assert rendered.count("실패:") == 1
+        assert rendered.count("성공:") == 1
+
+    @pytest.mark.asyncio
+    async def test_inbound_message_dedupes_formatted_rich_block_bullets(self, adapter):
+        fallback, blocks = self._production_message(adapter)
+        event = {
+            "text": fallback,
+            "blocks": blocks,
+            "user": "U_USER",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "1234567890.000001",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.await_args.args[0]
+        assert msg_event.text.count("실패:") == 1
+        assert msg_event.text.count("성공:") == 1
+
+    def test_render_message_text_keeps_additional_quoted_block_text(self, adapter):
+        rendered = adapter._render_message_text(
+            {
+                "text": "Can you summarize this?",
+                "blocks": [
+                    {
+                        "type": "rich_text",
+                        "elements": [
+                            {
+                                "type": "rich_text_quote",
+                                "elements": [
+                                    {
+                                        "type": "rich_text_section",
+                                        "elements": [
+                                            {"type": "text", "text": "Quoted line"}
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        assert "Can you summarize this?" in rendered
+        assert "> Quoted line" in rendered
+
+
 # ---------------------------------------------------------------------------
 # TestThreadImageContext — C1-images: images/files in prior thread messages
 # must be visible to the agent when it joins the conversation (#69185,

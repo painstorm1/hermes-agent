@@ -563,15 +563,18 @@ def _extract_text_from_slack_attachments(attachments: list) -> str:
 _SLACK_MRKDWN_LINK_RE = re.compile(
     r"<((?:https?|mailto):[^>|]+)(?:\|([^>]+))?>"
 )
+_SLACK_ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200d\u2060\ufeff]")
+_SLACK_LIST_BULLET_RE = re.compile(r"^[ \t]*(?:[-+*]|•)[ \t]+", re.MULTILINE)
 
 
 def _normalize_slack_text_for_dedupe(text: str) -> str:
-    """Canonicalize equivalent Slack plain-text and rich-block link forms.
+    """Canonicalize equivalent Slack text forms for duplicate detection only.
 
     Slack serializes the same authored link as ``<url|label>`` in the event's
     plain ``text`` field and as a structured ``link`` element in ``blocks``.
-    Comparing those raw strings makes a normal rich-text message look like
-    additional quoted content and appends the whole message a second time.
+    Rich blocks also omit mrkdwn style markers, replace list prefixes with
+    ``•``, and may differ in zero-width formatting characters. Comparing those
+    raw strings makes one visible message look like additional quoted content.
     """
 
     def _link(match: re.Match) -> str:
@@ -579,7 +582,24 @@ def _normalize_slack_text_for_dedupe(text: str) -> str:
         return f"{label} ({url})" if label and label != url else url
 
     canonical = _SLACK_MRKDWN_LINK_RE.sub(_link, text or "")
+    canonical = _SLACK_ZERO_WIDTH_RE.sub("", canonical)
+    canonical = _SLACK_LIST_BULLET_RE.sub("", canonical)
+    canonical = re.sub(r"[*_~`]", "", canonical)
     return re.sub(r"\s+", " ", canonical).strip()
+
+
+def _slack_text_contains_for_dedupe(container: str, candidate: str) -> bool:
+    """Return whether ``candidate`` is already represented by ``container``."""
+    candidate = (candidate or "").strip()
+    if not candidate:
+        return False
+    if candidate in (container or ""):
+        return True
+    normalized_candidate = _normalize_slack_text_for_dedupe(candidate)
+    return bool(
+        normalized_candidate
+        and normalized_candidate in _normalize_slack_text_for_dedupe(container)
+    )
 
 
 def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> str:
@@ -5913,10 +5933,8 @@ class SlackAdapter(BasePlatformAdapter):
                 # Only append if the blocks contain text not already present
                 # in the plain text field (avoids duplication).
                 stripped_blocks = blocks_text.strip()
-                block_text_is_duplicate = (
-                    stripped_blocks in text.strip()
-                    or _normalize_slack_text_for_dedupe(stripped_blocks)
-                    == _normalize_slack_text_for_dedupe(text)
+                block_text_is_duplicate = _slack_text_contains_for_dedupe(
+                    text, stripped_blocks
                 )
                 if stripped_blocks and not block_text_is_duplicate:
                     logger.debug(
@@ -7665,9 +7683,16 @@ class SlackAdapter(BasePlatformAdapter):
 
         blocks = msg.get("blocks")
         extras: list[str] = []
+
+        def _already_rendered(candidate: str) -> bool:
+            return any(
+                _slack_text_contains_for_dedupe(existing, candidate)
+                for existing in (msg_text, *extras)
+            )
+
         if blocks:
             rich_text = _extract_text_from_slack_blocks(blocks).strip()
-            if rich_text and rich_text not in msg_text:
+            if rich_text and not _already_rendered(rich_text):
                 extras.append(rich_text)
             for block in blocks:
                 block_type = (block or {}).get("type", "")
@@ -7675,7 +7700,7 @@ class SlackAdapter(BasePlatformAdapter):
                     text_obj = block.get("text") or {}
                     if isinstance(text_obj, dict):
                         section_text = (text_obj.get("text") or "").strip()
-                        if section_text and section_text not in msg_text and all(section_text not in e for e in extras):
+                        if section_text and not _already_rendered(section_text):
                             extras.append(section_text)
         # Legacy ``attachments`` (Alertmanager, Grafana, PagerDuty, CI bots):
         # apps often post with an empty ``text`` and the real content in
