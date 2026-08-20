@@ -40,6 +40,28 @@ def test_cron_profile_homes_follow_allowlist(tmp_path, monkeypatch):
     assert [name for name, _home in homes] == ["default", "worker"]
 
 
+def test_cron_profile_homes_include_active_named_profile_once(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    default_home = tmp_path / ".hermes"
+    active_home = default_home / "profiles" / "fn_cool"
+    for home in (active_home, default_home / "profiles" / "worker"):
+        home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(active_home))
+
+    import gateway.run as gateway_run
+
+    homes = gateway_run._multiplex_profile_homes(
+        GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["worker"],
+        )
+    )
+
+    assert [name for name, _home in homes] == ["default", "worker", "fn_cool"]
+    assert sum(name == "fn_cool" for name, _home in homes) == 1
+    assert dict(homes)["fn_cool"] == active_home
+
+
 class TestNamedProfileMultiplexerGuard:
     """_guard_named_profile_under_multiplexer is inert unless all conditions hold."""
 

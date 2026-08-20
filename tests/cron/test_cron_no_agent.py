@@ -245,6 +245,39 @@ def test_agent_provider_timeout_delivery_keeps_fallback_guidance(hermes_env, mon
 # ---------------------------------------------------------------------------
 
 
+def test_run_job_script_uses_shared_bash_resolver(hermes_env, monkeypatch):
+    import cron.scheduler as scheduler
+    import tools.environments.local as local_environment
+
+    script = hermes_env / "scripts" / "probe.sh"
+    script.write_text("echo ok\n", encoding="utf-8")
+    argv_seen = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return "ok\n", ""
+
+    def fake_popen(argv, **_kwargs):
+        argv_seen.append(argv)
+        return FakeProcess()
+
+    monkeypatch.setattr(local_environment, "_find_bash", lambda: "shared-bash")
+    monkeypatch.setattr(scheduler.subprocess, "Popen", fake_popen)
+
+    assert scheduler._run_job_script("probe.sh") == (True, "ok")
+    assert argv_seen[0][0] == "shared-bash"
+
+    def no_bash():
+        raise RuntimeError("missing")
+
+    monkeypatch.setattr(local_environment, "_find_bash", no_bash)
+    ok, output = scheduler._run_job_script("probe.sh")
+    assert ok is False
+    assert "bash not found" in output
+
+
 def test_run_job_script_path_traversal_still_blocked(hermes_env):
     """Security regression: shell-script support must NOT loosen containment."""
     from cron.scheduler import _run_job_script

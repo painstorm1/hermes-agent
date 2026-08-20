@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -234,10 +233,13 @@ class WebhookRouteProcessor:
 
         suffix = path.suffix.lower()
         if suffix in {".sh", ".bash"}:
-            bash = shutil.which("bash") or (
-                "/bin/bash" if os.path.isfile("/bin/bash") else None
-            )
-            if bash is None:
+            from tools.environments.local import _find_bash
+
+            try:
+                bash = _find_bash()
+            except RuntimeError:
+                bash = None
+            if not bash:
                 logger.warning("[webhook] script ignored webhook: bash not found")
                 return False, None
             argv = [bash, str(path)]

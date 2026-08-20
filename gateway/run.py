@@ -2053,14 +2053,24 @@ class SecondaryPortBindingConfigError(MultiplexConfigError):
 
 def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     """Return the authoritative profile set for one multiplex gateway config."""
-    from hermes_cli.profiles import profiles_to_serve
+    from hermes_cli.profiles import (
+        get_active_profile_name,
+        get_profile_dir,
+        profiles_to_serve,
+    )
 
-    return list(
+    homes = list(
         profiles_to_serve(
             multiplex=True,
             profile_allowlist=getattr(config, "multiplex_profile_allowlist", None),
         )
     )
+    active = get_active_profile_name()
+    if active not in {"default", "custom"} and all(
+        name != active for name, _home in homes
+    ):
+        homes.append((active, get_profile_dir(active)))
+    return homes
 
 
 @_contextmanager

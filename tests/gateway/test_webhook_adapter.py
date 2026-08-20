@@ -478,6 +478,37 @@ class TestPayloadFilters:
         assert captured[0].text == "Task: PAY BILLS"
         assert captured[0].raw_message["body"] == "PAY BILLS"
 
+    def test_shell_script_uses_shared_bash_resolver(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        (scripts / "filter.sh").write_text("echo ok\n", encoding="utf-8")
+
+        import gateway.platforms.webhook_filters as webhook_filters
+        import tools.environments.local as local_environment
+
+        argv_seen = []
+
+        def fake_run(argv, **_kwargs):
+            argv_seen.append(argv)
+            return MagicMock(returncode=0, stdout='{"filtered": true}\n', stderr="")
+
+        monkeypatch.setattr(local_environment, "_find_bash", lambda: "shared-bash")
+        monkeypatch.setattr(webhook_filters.subprocess, "run", fake_run)
+
+        processor = _make_adapter()._route_processor
+        assert processor.run_route_script("filter.sh", {}) == (
+            True,
+            {"filtered": True},
+        )
+        assert argv_seen[0][0] == "shared-bash"
+
+        def no_bash():
+            raise RuntimeError("missing")
+
+        monkeypatch.setattr(local_environment, "_find_bash", no_bash)
+        assert processor.run_route_script("filter.sh", {}) == (False, None)
+
 
 # ===================================================================
 # HTTP handling
