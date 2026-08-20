@@ -1,6 +1,8 @@
 """Pure tool-call guardrail primitive tests."""
 
 import json
+import threading
+import time
 
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
@@ -167,6 +169,59 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
+
+
+def test_total_tool_cap_allows_five_and_blocks_sixth_distinct_call():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_total_tools=5))
+    )
+    for i in range(5):
+        assert controller.before_call(f"tool_{i}", {"i": i}).action == "allow"
+    decision = controller.before_call("tool_5", {"i": 5})
+    assert decision.action == "block"
+    assert decision.code == "loop_total_tool_cap"
+    assert decision.count == 5
+
+
+def test_total_tool_cap_check_and_increment_is_atomic_for_concurrent_calls():
+    class SlowInt(int):
+        def __add__(self, other):
+            # Force a context switch between reading and writing the counter.
+            time.sleep(0.05)
+            return SlowInt(super().__add__(other))
+
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_total_tools=5))
+    )
+    controller._turn_total_tool_count = SlowInt(0)
+    start = threading.Barrier(16)
+    decisions = []
+    decisions_lock = threading.Lock()
+
+    def call_tool(index):
+        start.wait()
+        decision = controller.before_call(f"tool_{index}", {"i": index})
+        with decisions_lock:
+            decisions.append(decision)
+
+    threads = [threading.Thread(target=call_tool, args=(i,)) for i in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sum(decision.action == "allow" for decision in decisions) == 5
+    assert sum(decision.code == "loop_total_tool_cap" for decision in decisions) == 11
+    assert controller._turn_total_tool_count == 5
+
+
+def test_total_tool_cap_zero_is_unlimited():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_total_tools=0))
+    )
+    for i in range(100):
+        assert controller.before_call(f"tool_{i}", {"i": i}).action == "allow"
 
 
 

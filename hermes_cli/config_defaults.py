@@ -44,6 +44,14 @@ DEFAULT_CONFIG = {
     },
     "agent": {
         "max_turns": 500,
+        # One fresh, completion-only turn after a certified iteration-limit
+        # summary. Exact top-level platforms only; disabled by default. This
+        # never changes tools or approvals and cannot recurse.
+        "completion_reserve": {
+            "enabled": False,
+            "platforms": [],
+            "max_turns": 60,
+        },
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -654,6 +662,7 @@ DEFAULT_CONFIG = {
         "loop_caps": {
             "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
             "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
+            "max_total_tools": 0,     # max all tool calls per turn (0 = unlimited)
         },
     },
 
@@ -2416,6 +2425,13 @@ DEFAULT_CONFIG = {
         # with ONE alert (no re-alert every tick) and NO LLM call is made.
         # Set to false to restore the old behavior (fail during the run).
         "preflight": True,
+        # Cron uses an exact job allowlist instead of the platform-wide agent
+        # switch so unrelated scheduled work never inherits extra budget.
+        "completion_reserve": {
+            "enabled": False,
+            "job_ids": [],
+            "max_turns": 60,
+        },
         # Fail closed when an unpinned job's current global model/provider
         # differs from its creation-time snapshot. This prevents unattended
         # jobs from silently inheriting a paid default. Set to false only when

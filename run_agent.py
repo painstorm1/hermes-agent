@@ -510,6 +510,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        skip_tool_search_assembly: bool = False,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -535,6 +536,7 @@ class AIAgent:
             max_iterations=max_iterations,
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
+            skip_tool_search_assembly=skip_tool_search_assembly,
             save_trajectories=save_trajectories,
             verbose_logging=verbose_logging,
             quiet_mode=quiet_mode,
@@ -8133,6 +8135,10 @@ class AIAgent:
             self._tool_guardrail_halt_decision = decision
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
+        if decision.code == "loop_total_tool_cap":
+            route_message = getattr(self, "_route_tool_limit_message", "")
+            if route_message:
+                return route_message
         tool = decision.tool_name or "a tool"
         return (
             f"I stopped retrying {tool} because it hit the tool-call guardrail "
@@ -8353,6 +8359,12 @@ class AIAgent:
             set_accounting_context,
         )
         from agent import relay_runtime
+        from agent.completion_reserve import (
+            continue_once,
+            contract as completion_reserve_contract,
+            is_iteration_limit,
+            turns_for_platform,
+        )
         from agent.conversation_loop import run_conversation
         from agent.portal_tags import (
             reset_conversation_context,
@@ -8370,6 +8382,30 @@ class AIAgent:
             "task_id": effective_task_id,
             "platform": getattr(self, "platform", None) or "",
         }
+        reserve_turns = getattr(self, "_completion_reserve_turns", None)
+        if reserve_turns is None:
+            try:
+                from hermes_cli.config import load_config_readonly
+
+                reserve_turns = turns_for_platform(
+                    load_config_readonly(), task_context["platform"]
+                )
+            except Exception:
+                reserve_turns = 0
+            self._completion_reserve_turns = reserve_turns
+
+        first_user_message = user_message
+        first_persist_user_message = persist_user_message
+        if reserve_turns and isinstance(user_message, str):
+            first_user_message = (
+                f"{user_message}{completion_reserve_contract(effective_task_id)}"
+            )
+            if persist_user_message is None:
+                first_persist_user_message = user_message
+        else:
+            # Fail closed for multimodal/structured inputs until they have a
+            # canonical hidden-policy injection path.
+            reserve_turns = 0
         relay_turn_id = (
             f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
         )
@@ -8701,17 +8737,42 @@ class AIAgent:
                         durable_turn_lease_thread.start()
                     result = run_conversation(
                         self,
-                        user_message,
+                        first_user_message,
                         system_message,
                         conversation_history,
                         effective_task_id,
                         stream_callback,
-                        persist_user_message,
+                        first_persist_user_message,
                         persist_user_timestamp=persist_user_timestamp,
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
                     )
+                    if reserve_turns and is_iteration_limit(result):
+
+                        def _run_completion_turn(prompt: str, history: list) -> dict:
+                            return run_conversation(
+                                self,
+                                prompt,
+                                system_message,
+                                history,
+                                effective_task_id,
+                                stream_callback,
+                                prompt,
+                                persist_user_display_kind="auto_continue",
+                                persist_user_display_metadata={
+                                    "reason": "completion_reserve"
+                                },
+                                moa_config=moa_config,
+                            )
+
+                        result = continue_once(
+                            self,
+                            result,
+                            task_id=effective_task_id,
+                            reserve_turns=reserve_turns,
+                            run_turn=_run_completion_turn,
+                        )
                 finally:
                     # The lease remains held through relay/task finalization, but
                     # those post-loop steps must not receive a late refresh

@@ -1,6 +1,7 @@
 """Runtime tests for tool-call loop guardrails."""
 
 import json
+import os
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -293,7 +294,7 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
     assert observed["start"] == expected
     assert observed["dispatch"] == expected
     assert observed["checkpoint"] == [
-        ("/approved/path", "before write_file")
+        (os.path.normpath("/approved/path"), "before write_file")
     ]
 
 
@@ -374,6 +375,21 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
 
 
+
+
+def test_total_cap_uses_route_specific_user_message_when_present():
+    from agent.tool_guardrails import ToolGuardrailDecision
+
+    agent = object.__new__(AIAgent)
+    agent._route_tool_limit_message = "ask fn_cool"
+    decision = ToolGuardrailDecision(
+        action="block",
+        code="loop_total_tool_cap",
+        tool_name="luna_web_search",
+        count=5,
+    )
+
+    assert agent._toolguard_controlled_halt_response(decision) == "ask fn_cool"
 
 
 def test_guardrail_halt_emits_final_response_through_stream_delta_callback():

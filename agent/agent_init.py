@@ -567,6 +567,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    skip_tool_search_assembly: bool = False,
 ):
     """
     Initialize the AI Agent.
@@ -621,6 +622,9 @@ def init_agent(
 
     agent.model = model
     agent.max_iterations = max_iterations
+    # Lazily resolved by AIAgent.run_conversation from profile config. Cron can
+    # replace this with a job-allowlist result before its first turn.
+    agent._completion_reserve_turns = None
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
@@ -907,6 +911,7 @@ def init_agent(
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
+    agent.skip_tool_search_assembly = bool(skip_tool_search_assembly)
     
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
@@ -1518,6 +1523,7 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        skip_tool_search_assembly=agent.skip_tool_search_assembly,
     )
     
     # Show tool configuration and store valid tool names for validation
