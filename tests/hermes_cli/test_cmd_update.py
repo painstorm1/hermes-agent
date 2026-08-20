@@ -1,6 +1,8 @@
 """Tests for cmd_update — branch fallback when remote branch doesn't exist."""
 
 import hashlib
+import json
+import struct
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import ANY, patch
@@ -884,8 +886,10 @@ class TestNodeRuntimeNpmResolution:
             env=ANY,
         )
 
-    def test_git_failure_zip_fallback_rebuilds_missing_desktop(self, tmp_path, monkeypatch):
-        """The Windows ZIP fallback restores Desktop after replacing ``apps/``."""
+    def test_git_failure_zip_fallback_preserves_and_rebuilds_desktop(
+        self, tmp_path, monkeypatch
+    ):
+        """The Windows ZIP fallback preserves Desktop while replacing ``apps/``."""
         import zipfile
 
         from hermes_cli import main as hm
@@ -896,7 +900,26 @@ class TestNodeRuntimeNpmResolution:
         desktop_dir = project_root / "apps" / "desktop"
         packaged_exe = desktop_dir / "release" / "win-unpacked" / "Hermes.exe"
         packaged_exe.parent.mkdir(parents=True)
-        packaged_exe.write_bytes(b"desktop")
+        executable = bytearray(0x400)
+        executable[0:2] = b"MZ"
+        struct.pack_into("<I", executable, 0x3C, 0x80)
+        executable[0x80:0x84] = b"PE\x00\x00"
+        struct.pack_into("<HHIIIHH", executable, 0x84, 0x8664, 1, 0, 0, 0, 0, 0x0002)
+        struct.pack_into("<II", executable, 0x98 + 16, 0x200, 0x200)
+        packaged_exe.write_bytes(executable)
+        resources = packaged_exe.parent / "resources"
+        resources.mkdir()
+        (resources / "app.asar").write_bytes(b"app-asar")
+        (resources / "install-stamp.json").write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "commit": "1234567890abcdef",
+                    "branch": "main",
+                }
+            ),
+            encoding="utf-8",
+        )
 
         def write_source_zip(_url, destination):
             with zipfile.ZipFile(destination, "w") as archive:
@@ -971,7 +994,7 @@ class TestNodeRuntimeNpmResolution:
                 gateway_mode=False,
             )
 
-        assert desktop_builds == [True]
+        assert desktop_builds == [False]
 
 
 class TestUpdateNodeDependencies:

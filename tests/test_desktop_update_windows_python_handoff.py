@@ -64,13 +64,20 @@ def test_invoke_hermes_step_calls_drive_python_not_the_shim() -> None:
 def test_update_invocation_uses_module_entrypoint() -> None:
     source = _read()
 
-    assert '@("-m", "hermes_cli.main", "update"' in source, (
+    assert '$moduleArgs = @("-m", "hermes_cli.main")' in source, (
+        "The Windows hand-off must compose every Hermes command from the "
+        "python module entrypoint."
+    )
+    assert '$updateArgs = $moduleArgs + @("update"' in source, (
         "The update step must invoke `python.exe -m hermes_cli.main update ...` "
         "so the inherited image handle lands on python.exe, which uv never has "
         "to replace."
     )
+    assert '$buildArgs = $moduleArgs + @("desktop", "--build-only")' in source, (
+        "The Desktop validation build must use the shared module entrypoint."
+    )
     assert (
-        '@("-m", "hermes_cli.main", "desktop", "--force-build", "--build-only")'
+        '$forceBuildArgs = $moduleArgs + @("desktop", "--force-build", "--build-only")'
         in source
     ), (
         "The desktop rebuild step must also go through "
