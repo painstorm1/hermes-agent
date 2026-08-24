@@ -310,6 +310,117 @@ from plugins.platforms.telegram.telegram_network import (
 )
 from utils import atomic_replace, env_float, env_int
 
+_FNOS_AUTOMATION_URL = "http://127.0.0.1:3000/api/fnos/automation-ops/telegram"
+_FNOS_ENV_PATH = _Path("D:/FN_Runtime/FN_OS/.env.local")
+_FNOS_JOB_ID_RE = re.compile(r"[0-9a-fA-F]{12}")
+_FNOS_CALLBACK_RE = re.compile(
+    r"fnx:(?P<action>[er]):(?P<job_id>[0-9a-f]{12}):(?P<run_ref>[0-9a-f]{8})?"
+)
+_FNOS_FAILURE_RESULT_RE = re.compile(
+    r"^[ \t]*결과:[ \t]*(?:❌[ \t]*실패|⚠️?[ \t]*부분실패)[ \t]*$",
+    re.MULTILINE,
+)
+
+
+def _load_fnos_automation_agent_token() -> str:
+    """Load the FNOS automation token without logging or caching it."""
+    try:
+        from dotenv import dotenv_values
+
+        value = dotenv_values(_FNOS_ENV_PATH).get("AUTOMATION_AGENT_TOKEN")
+        token = str(value or "").strip()
+        if token:
+            return token
+    except Exception:
+        pass
+    return (os.getenv("AUTOMATION_AGENT_TOKEN") or "").strip()
+
+
+def _request_fnos_automation(
+    action: str, job_id: str, run_ref: Optional[str]
+) -> str:
+    """Call the local FNOS automation endpoint and return its user-facing text."""
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+
+    token = _load_fnos_automation_agent_token()
+    if not token:
+        raise RuntimeError("AUTOMATION_AGENT_TOKEN is not configured")
+
+    payload = {"action": action, "job_id": job_id}
+    if run_ref:
+        payload["run_ref"] = run_ref
+    request = Request(
+        _FNOS_AUTOMATION_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-automation-agent-token": token,
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=15) as response:
+            raw = response.read()
+    except HTTPError as exc:
+        try:
+            raw = exc.read()
+        finally:
+            exc.close()
+
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("FNOS returned an invalid response") from exc
+
+    if isinstance(result, dict):
+        if isinstance(result.get("text"), str):
+            return result["text"]
+        if result.get("error") is not None:
+            return str(result["error"])
+    raise RuntimeError("FNOS response did not include text or error")
+
+
+def _is_no_agent_cron_job(job_id: str) -> bool:
+    """Fail closed unless the callback target is a current no-agent cron job."""
+    try:
+        from cron.jobs import get_job
+
+        job = get_job(job_id)
+    except Exception:
+        return False
+    return bool(job and job.get("no_agent"))
+
+
+def _fnos_cron_failure_markup(
+    content: str, metadata: Optional[Dict[str, Any]]
+) -> Optional[Any]:
+    """Build FNOS action buttons for a failed cron report."""
+    job_id = str((metadata or {}).get("job_id") or "")
+    if not _FNOS_JOB_ID_RE.fullmatch(job_id):
+        return None
+    if not _FNOS_FAILURE_RESULT_RE.search(content):
+        return None
+    if not _is_no_agent_cron_job(job_id):
+        return None
+
+    job_id = job_id.lower()
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "❗ 실패 이유 확인", callback_data=f"fnx:e:{job_id}:"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "▶ 실패한 부분 재실행", callback_data=f"fnx:r:{job_id}:"
+                )
+            ],
+        ]
+    )
+
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
     "image/png": ".png",
@@ -5137,12 +5248,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
+            fnos_failure_markup = _fnos_cron_failure_markup(content, metadata)
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if fnos_failure_markup is None and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -5197,6 +5309,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
             for i, chunk in enumerate(chunks):
                 retried_thread_not_found = False
+                fnos_button_kwargs = (
+                    {"reply_markup": fnos_failure_markup}
+                    if fnos_failure_markup is not None and i == len(chunks) - 1
+                    else {}
+                )
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
                 private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
                 # reply_to_mode="off" on the existing telegram_dm_topic_reply_fallback path
@@ -5248,6 +5365,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
+                                **fnos_button_kwargs,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -5262,6 +5380,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
+                                    **fnos_button_kwargs,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
@@ -7023,6 +7142,89 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- FNOS cron-failure callbacks (fnx:action:job_id:run_ref) ---
+        if data.startswith("fnx:"):
+            match = _FNOS_CALLBACK_RE.fullmatch(data)
+            if match is None:
+                await query.answer(text="잘못된 FNOS 자동화 요청입니다.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ 이 자동화 요청을 실행할 권한이 없습니다.")
+                return
+
+            action = "explain" if match.group("action") == "e" else "rerun"
+            job_id = match.group("job_id")
+            run_ref = match.group("run_ref") or None
+            await query.answer(text="요청을 확인하고 있습니다…")
+            try:
+                response_text = await asyncio.to_thread(
+                    _request_fnos_automation, action, job_id, run_ref
+                )
+            except Exception as exc:
+                safe_error = _redact_telegram_error_text(exc) or type(exc).__name__
+                response_text = f"요청 처리 실패: {safe_error}"
+
+            if query_chat_id is None:
+                logger.warning("[%s] FNOS callback has no chat id", self.name)
+                return
+
+            send_kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(query_chat_id),
+                "text": response_text,
+                "parse_mode": None,
+                **self._link_preview_kwargs(),
+            }
+            if query_thread_id is not None:
+                chat_type_value = getattr(query_chat_type, "value", query_chat_type)
+                is_private_chat = str(chat_type_value).lower() in {
+                    "private",
+                    str(ChatType.PRIVATE).lower(),
+                    str(getattr(ChatType.PRIVATE, "value", ChatType.PRIVATE)).lower(),
+                }
+                prompt_message_id = getattr(query_message, "message_id", None)
+                if is_private_chat and prompt_message_id is not None:
+                    reply_to_id = int(prompt_message_id)
+                    send_kwargs["reply_to_message_id"] = reply_to_id
+                    send_kwargs.update(
+                        self._thread_kwargs_for_send(
+                            str(query_chat_id),
+                            str(query_thread_id),
+                            {
+                                "thread_id": str(query_thread_id),
+                                "telegram_dm_topic_reply_fallback": True,
+                            },
+                            reply_to_message_id=reply_to_id,
+                            reply_to_mode=self._reply_to_mode,
+                        )
+                    )
+                else:
+                    send_kwargs.update(
+                        self._thread_kwargs_for_send(
+                            str(query_chat_id),
+                            str(query_thread_id),
+                            {"thread_id": str(query_thread_id)},
+                            reply_to_mode=self._reply_to_mode,
+                        )
+                    )
+
+            try:
+                await self._send_message_with_thread_fallback(**send_kwargs)
+            except Exception as exc:
+                logger.error(
+                    "[%s] FNOS callback response delivery failed: %s",
+                    self.name,
+                    _redact_telegram_error_text(exc),
+                )
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
