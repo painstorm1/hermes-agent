@@ -762,6 +762,28 @@ class TestSendTelegramHtmlDetection:
         assert bot.send_message.await_count == 2
         sleep_mock.assert_awaited_once()
 
+    def test_cron_failure_metadata_reaches_standalone_send_message(self, monkeypatch):
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+        markup = object()
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter._fnos_cron_failure_markup",
+            lambda content, metadata: markup,
+        )
+
+        result = asyncio.run(
+            _send_to_platform(
+                Platform.TELEGRAM,
+                SimpleNamespace(token="tok", extra={}),
+                "123",
+                "결과: ⚠️ 부분실패",
+                metadata={"job_id": "deb3fe82299a"},
+            )
+        )
+
+        assert result["success"] is True
+        assert bot.send_message.await_args.kwargs["reply_markup"] is markup
+
 
 class TestSendTelegramThreadIdMapping:
     """General-topic mapping in _send_telegram (issue #22267).

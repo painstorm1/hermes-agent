@@ -358,6 +358,7 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
+        assert send_mock.call_args.kwargs["metadata"] == {"job_id": "test-job"}
 
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
@@ -486,6 +487,7 @@ class TestDeliverResultWrapping:
         text_sent = adapter.send.call_args[0][1]
         assert "MEDIA:" not in text_sent
         assert "Here is TTS" in text_sent
+        assert adapter.send.call_args.kwargs["metadata"]["job_id"] == "tts-job"
 
         # Audio file should be sent as a voice attachment
         adapter.send_voice.assert_called_once()

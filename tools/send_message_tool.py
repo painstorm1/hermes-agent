@@ -922,7 +922,17 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    args=None,
+    metadata=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -996,6 +1006,23 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # after all text chunks.
     if platform == Platform.TELEGRAM:
         disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
+        reply_markup = None
+        if metadata:
+            try:
+                from plugins.platforms.telegram.adapter import _fnos_cron_failure_markup
+
+                reply_markup = _fnos_cron_failure_markup(message, metadata)
+            except Exception:
+                logger.debug(
+                    "Standalone Telegram cron markup evaluation failed",
+                    exc_info=True,
+                )
+            if metadata.get("job_id"):
+                logger.info(
+                    "Telegram standalone cron markup diagnostic job_id=%s built=%s",
+                    metadata.get("job_id"),
+                    reply_markup is not None,
+                )
         return await _send_telegram(
             pconfig.token,
             chat_id,
@@ -1004,6 +1031,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            reply_markup=reply_markup,
+            metadata=metadata,
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1331,7 +1360,17 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    disable_link_previews=False,
+    force_document=False,
+    reply_markup=None,
+    metadata=None,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1455,12 +1494,26 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             text_chunks = BasePlatformAdapter.truncate_message(
                 formatted, 4096, len_fn=utf16_len
             )
-            for chunk in text_chunks:
+            for index, chunk in enumerate(text_chunks):
+                button_kwargs = (
+                    {"reply_markup": reply_markup}
+                    if reply_markup is not None and index == len(text_chunks) - 1
+                    else {}
+                )
+                if (metadata or {}).get("job_id"):
+                    logger.info(
+                        "Telegram standalone sendMessage diagnostic job_id=%s "
+                        "chunk=%d/%d reply_markup=%s",
+                        (metadata or {}).get("job_id"),
+                        index + 1,
+                        len(text_chunks),
+                        bool(button_kwargs),
+                    )
                 try:
                     last_msg = await _send_telegram_message_with_retry(
                         bot,
                         chat_id=int_chat_id, text=chunk,
-                        parse_mode=send_parse_mode, **text_kwargs
+                        parse_mode=send_parse_mode, **button_kwargs, **text_kwargs
                     )
                 except Exception as md_error:
                     # Thread not found — retry without message_thread_id so the
@@ -1475,7 +1528,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=chunk,
-                            parse_mode=send_parse_mode, **text_kwargs
+                            parse_mode=send_parse_mode, **button_kwargs, **text_kwargs
                         )
                     elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
                         logger.warning(
@@ -1494,7 +1547,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=plain,
-                            parse_mode=None, **text_kwargs
+                            parse_mode=None, **button_kwargs, **text_kwargs
                         )
                     else:
                         raise
