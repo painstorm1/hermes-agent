@@ -5249,13 +5249,6 @@ class TelegramAdapter(BasePlatformAdapter):
         
         try:
             fnos_failure_markup = _fnos_cron_failure_markup(content, metadata)
-            if (metadata or {}).get("job_id"):
-                logger.info(
-                    "[%s] FNOS cron markup diagnostic job_id=%s built=%s",
-                    self.name,
-                    (metadata or {}).get("job_id"),
-                    fnos_failure_markup is not None,
-                )
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
@@ -5321,16 +5314,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     if fnos_failure_markup is not None and i == len(chunks) - 1
                     else {}
                 )
-                if (metadata or {}).get("job_id"):
-                    logger.info(
-                        "[%s] FNOS cron sendMessage diagnostic job_id=%s "
-                        "chunk=%d/%d reply_markup=%s",
-                        self.name,
-                        (metadata or {}).get("job_id"),
-                        i + 1,
-                        len(chunks),
-                        bool(fnos_button_kwargs),
-                    )
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
                 private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
                 # reply_to_mode="off" on the existing telegram_dm_topic_reply_fallback path

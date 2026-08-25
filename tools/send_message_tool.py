@@ -1017,12 +1017,6 @@ async def _send_to_platform(
                     "Standalone Telegram cron markup evaluation failed",
                     exc_info=True,
                 )
-            if metadata.get("job_id"):
-                logger.info(
-                    "Telegram standalone cron markup diagnostic job_id=%s built=%s",
-                    metadata.get("job_id"),
-                    reply_markup is not None,
-                )
         return await _send_telegram(
             pconfig.token,
             chat_id,
@@ -1500,15 +1494,6 @@ async def _send_telegram(
                     if reply_markup is not None and index == len(text_chunks) - 1
                     else {}
                 )
-                if (metadata or {}).get("job_id"):
-                    logger.info(
-                        "Telegram standalone sendMessage diagnostic job_id=%s "
-                        "chunk=%d/%d reply_markup=%s",
-                        (metadata or {}).get("job_id"),
-                        index + 1,
-                        len(text_chunks),
-                        bool(button_kwargs),
-                    )
                 try:
                     last_msg = await _send_telegram_message_with_retry(
                         bot,

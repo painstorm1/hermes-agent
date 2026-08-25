@@ -2868,15 +2868,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
-            if platform == Platform.TELEGRAM:
-                logger.info(
-                    "Job '%s': Telegram cron delivery diagnostic path=live "
-                    "metadata_job_id=%s thread_id=%s",
-                    job["id"],
-                    route_metadata.get("job_id"),
-                    route_thread_id,
-                )
-
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
@@ -3132,14 +3123,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             standalone_metadata = {"job_id": job["id"]}
-            if platform == Platform.TELEGRAM:
-                logger.info(
-                    "Job '%s': Telegram cron delivery diagnostic path=standalone "
-                    "metadata_job_id=%s thread_id=%s",
-                    job["id"],
-                    standalone_metadata["job_id"],
-                    thread_id,
-                )
             coro = _send_to_platform(
                 platform,
                 pconfig,
