@@ -2506,7 +2506,14 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    output_ref: Optional[str] = None,
+    cron_process_failed: bool = False,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -2517,6 +2524,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    safe_output_ref = str(output_ref or "")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.md", safe_output_ref):
+        safe_output_ref = ""
+
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
@@ -2868,6 +2879,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
+            if safe_output_ref:
+                route_metadata["cron_output_ref"] = safe_output_ref
+            if cron_process_failed is True:
+                route_metadata["cron_process_failed"] = True
+
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
@@ -3123,6 +3139,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             standalone_metadata = {"job_id": job["id"]}
+            if safe_output_ref:
+                standalone_metadata["cron_output_ref"] = safe_output_ref
+            if cron_process_failed is True:
+                standalone_metadata["cron_process_failed"] = True
             coro = _send_to_platform(
                 platform,
                 pconfig,
@@ -6275,6 +6295,7 @@ def _run_one_job_body(
         execution_id = create_execution(job["id"], source="direct")["id"]
     delivery_attempted = False
     delivery_error = None
+    saved_output_ref: Optional[str] = None
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -6393,6 +6414,7 @@ def _run_one_job_body(
                 if not owns_output:
                     raise _FireClaimLostDuringSideEffect
                 output_file = save_job_output(job["id"], output)
+                saved_output_ref = Path(output_file).name
             if verbose:
                 logger.info("Output saved to: %s", output_file)
 
@@ -6505,6 +6527,8 @@ def _run_one_job_body(
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
+                            output_ref=saved_output_ref,
+                            cron_process_failed=not success,
                         )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
@@ -6644,6 +6668,8 @@ def _run_one_job_body(
                     _summarize_cron_failure_for_delivery(job, _err_text),
                     adapters=adapters,
                     loop=loop,
+                    output_ref=saved_output_ref,
+                    cron_process_failed=True,
                 )
             except Exception as delivery_exc:
                 delivery_error = str(delivery_exc)

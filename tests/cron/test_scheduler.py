@@ -349,7 +349,11 @@ class TestDeliverResultWrapping:
                 "deliver": "origin",
                 "origin": {"platform": "telegram", "chat_id": "123"},
             }
-            _deliver_result(job, "Here is today's summary.")
+            _deliver_result(
+                job,
+                "Here is today's summary.",
+                output_ref="2026-08-30_10-20-30.md",
+            )
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
@@ -358,7 +362,35 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
-        assert send_mock.call_args.kwargs["metadata"] == {"job_id": "test-job"}
+        assert send_mock.call_args.kwargs["metadata"] == {
+            "job_id": "test-job",
+            "cron_output_ref": "2026-08-30_10-20-30.md",
+        }
+
+
+    def test_standalone_process_failure_metadata_is_true_without_output_ref(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock(platforms={Platform.TELEGRAM: pconfig})
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            _deliver_result(
+                {
+                    "id": "failed-job",
+                    "name": "failed-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "⚠️ Cron 'failed-job' failed: timeout",
+                cron_process_failed=True,
+            )
+
+        assert send_mock.call_args.kwargs["metadata"] == {
+            "job_id": "failed-job",
+            "cron_process_failed": True,
+        }
 
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
@@ -480,6 +512,8 @@ class TestDeliverResultWrapping:
                 f"Here is TTS\nMEDIA:{media_path}",
                 adapters={Platform.DISCORD: adapter},
                 loop=loop,
+                output_ref="2026-08-30_10-20-31.md",
+                cron_process_failed=True,
             )
 
         # Text should be sent without the MEDIA tag
@@ -487,7 +521,11 @@ class TestDeliverResultWrapping:
         text_sent = adapter.send.call_args[0][1]
         assert "MEDIA:" not in text_sent
         assert "Here is TTS" in text_sent
-        assert adapter.send.call_args.kwargs["metadata"]["job_id"] == "tts-job"
+        assert adapter.send.call_args.kwargs["metadata"] == {
+            "job_id": "tts-job",
+            "cron_output_ref": "2026-08-30_10-20-31.md",
+            "cron_process_failed": True,
+        }
 
         # Audio file should be sent as a voice attachment
         adapter.send_voice.assert_called_once()
@@ -1499,6 +1537,7 @@ class TestSilentDelivery:
             from cron.scheduler import tick
             tick(verbose=False)
         deliver_mock.assert_called_once()
+        assert deliver_mock.call_args.kwargs["cron_process_failed"] is False
 
 
     def test_failed_job_always_delivers(self):
@@ -1506,12 +1545,28 @@ class TestSilentDelivery:
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/2026-08-30_10-20-32.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
         deliver_mock.assert_called_once()
+        assert deliver_mock.call_args.kwargs["output_ref"] == "2026-08-30_10-20-32.md"
+        assert deliver_mock.call_args.kwargs["cron_process_failed"] is True
+
+    def test_pre_save_failure_delivery_has_no_output_ref(self):
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
+             patch("cron.scheduler.save_job_output", side_effect=OSError("disk full")), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        deliver_mock.assert_called_once()
+        assert deliver_mock.call_args.kwargs.get("output_ref") is None
+        assert deliver_mock.call_args.kwargs["cron_process_failed"] is True
 
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \

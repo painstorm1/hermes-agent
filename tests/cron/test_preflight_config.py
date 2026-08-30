@@ -129,7 +129,9 @@ class TestMissingProviderKeyBlocks:
         job = _job()
         deliveries = []
 
-        def fake_deliver(job, content, adapters=None, loop=None):
+        def fake_deliver(
+            job, content, adapters=None, loop=None, output_ref=None, cron_process_failed=False
+        ):
             deliveries.append(content)
             return None
 
@@ -233,7 +235,9 @@ class TestOptOut:
         job = _job()
         deliveries = []
 
-        def fake_deliver(job, content, adapters=None, loop=None):
+        def fake_deliver(
+            job, content, adapters=None, loop=None, output_ref=None, cron_process_failed=False
+        ):
             deliveries.append(content)
             return None
 

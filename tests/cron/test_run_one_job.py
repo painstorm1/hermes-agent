@@ -29,7 +29,9 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("save", jid))
         return f"/tmp/{jid}.txt"
 
-    def fake_deliver(job, content, adapters=None, loop=None):
+    def fake_deliver(
+        job, content, adapters=None, loop=None, output_ref=None, cron_process_failed=False
+    ):
         calls.append(("deliver", job["id"]))
         return None
 
@@ -131,6 +133,53 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
             },
         )
     ]
+
+
+def test_run_one_job_post_save_exception_delivers_exact_output_ref_once(monkeypatch):
+    """A post-save failure alert must keep the saved output reference."""
+    delivered = []
+
+    monkeypatch.setattr(
+        s, "create_execution", lambda *_a, **_kw: {"id": "exec-post-save"}
+    )
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda *_a, **_kw: (True, "out", "final response", None),
+    )
+    monkeypatch.setattr(
+        s,
+        "save_job_output",
+        lambda *_a, **_kw: "/tmp/2026-08-30_10-20-33.md",
+    )
+    monkeypatch.setattr(
+        s,
+        "_is_cron_silence_response",
+        lambda _content: (_ for _ in ()).throw(RuntimeError("post-save boom")),
+    )
+
+    def fake_deliver(job, content, **kwargs):
+        delivered.append((job["id"], content, kwargs))
+        return None
+
+    monkeypatch.setattr(s, "_deliver_result", fake_deliver)
+    monkeypatch.setattr(s, "mark_job_run", lambda *_a, **_kw: None)
+    monkeypatch.setattr(s, "finish_execution", lambda *_a, **_kw: None)
+
+    ok = s.run_one_job(
+        {"id": "post-save", "name": "post-save", "deliver": "telegram"}
+    )
+
+    assert ok is False
+    assert len(delivered) == 1
+    assert delivered[0][0:2] == (
+        "post-save",
+        "⚠️ Cron 'post-save' failed: post-save boom",
+    )
+    assert delivered[0][2]["output_ref"] == "2026-08-30_10-20-33.md"
+    assert delivered[0][2]["cron_process_failed"] is True
 
 
 def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch):
