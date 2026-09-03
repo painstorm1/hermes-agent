@@ -324,6 +324,12 @@ _FNOS_FAILURE_RESULT_RE = re.compile(
     r"^[ \t]*결과:[ \t]*(?:❌[ \t]*실패|⚠️?[ \t]*부분실패)[ \t]*$",
     re.MULTILINE,
 )
+# 소싱회의 주간 질문 버튼(있음/없음). 상태는 FNOS가 들고 있고 어댑터는 응답만 전달한다.
+# 계약: FNOS docs/sourcing-meeting-agent-contract.md
+_FNOS_SOURCING_URL = "http://127.0.0.1:3000/api/fnos/import/sourcing-meetings/current"
+_FNOS_SOURCING_CALLBACK_RE = re.compile(
+    r"fnx:s:(?P<meeting_date>\d{4}-\d{2}-\d{2}):(?P<answer>[yn])"
+)
 
 
 def _load_fnos_automation_agent_token() -> str:
@@ -340,10 +346,8 @@ def _load_fnos_automation_agent_token() -> str:
     return (os.getenv("AUTOMATION_AGENT_TOKEN") or "").strip()
 
 
-def _request_fnos_automation(
-    action: str, job_id: str, run_ref: Optional[str]
-) -> str:
-    """Call the local FNOS automation endpoint and return its user-facing text."""
+def _post_fnos_json(url: str, payload: Dict[str, Any]) -> str:
+    """POST to a local FNOS agent endpoint and return its user-facing text (or error text)."""
     from urllib.error import HTTPError
     from urllib.request import Request, urlopen
 
@@ -351,12 +355,9 @@ def _request_fnos_automation(
     if not token:
         raise RuntimeError("AUTOMATION_AGENT_TOKEN is not configured")
 
-    payload = {"action": action, "job_id": job_id}
-    if run_ref:
-        payload["run_ref"] = run_ref
     request = Request(
-        _FNOS_AUTOMATION_URL,
-        data=json.dumps(payload).encode("utf-8"),
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
             "x-automation-agent-token": token,
@@ -384,6 +385,26 @@ def _request_fnos_automation(
         if result.get("error") is not None:
             return str(result["error"])
     raise RuntimeError("FNOS response did not include text or error")
+
+
+def _request_fnos_automation(
+    action: str, job_id: str, run_ref: Optional[str]
+) -> str:
+    """Call the local FNOS automation endpoint and return its user-facing text."""
+    payload: Dict[str, Any] = {"action": action, "job_id": job_id}
+    if run_ref:
+        payload["run_ref"] = run_ref
+    return _post_fnos_json(_FNOS_AUTOMATION_URL, payload)
+
+
+def _request_fnos_sourcing_answer(
+    meeting_date: str, answer: str, actor: Optional[str]
+) -> str:
+    """Record a sourcing-meeting 있음/없음 answer in FNOS and return its user-facing text."""
+    payload: Dict[str, Any] = {"action": "answer", "meeting_date": meeting_date, "answer": answer}
+    if actor:
+        payload["actor"] = f"telegram:{actor}"[:120]
+    return _post_fnos_json(_FNOS_SOURCING_URL, payload)
 
 
 def _get_current_cron_job(job_id: str) -> Optional[dict]:
@@ -7175,6 +7196,68 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def _reply_fnos_callback(
+        self,
+        query_message: Any,
+        query_chat_id: Any,
+        query_chat_type: Any,
+        query_thread_id: Any,
+        response_text: str,
+    ) -> None:
+        """Send an FNOS button result back to the chat/thread the button lived in."""
+        if query_chat_id is None:
+            logger.warning("[%s] FNOS callback has no chat id", self.name)
+            return
+
+        send_kwargs: Dict[str, Any] = {
+            "chat_id": normalize_telegram_chat_id(query_chat_id),
+            "text": response_text,
+            "parse_mode": None,
+            **self._link_preview_kwargs(),
+        }
+        if query_thread_id is not None:
+            chat_type_value = getattr(query_chat_type, "value", query_chat_type)
+            is_private_chat = str(chat_type_value).lower() in {
+                "private",
+                str(ChatType.PRIVATE).lower(),
+                str(getattr(ChatType.PRIVATE, "value", ChatType.PRIVATE)).lower(),
+            }
+            prompt_message_id = getattr(query_message, "message_id", None)
+            if is_private_chat and prompt_message_id is not None:
+                reply_to_id = int(prompt_message_id)
+                send_kwargs["reply_to_message_id"] = reply_to_id
+                send_kwargs.update(
+                    self._thread_kwargs_for_send(
+                        str(query_chat_id),
+                        str(query_thread_id),
+                        {
+                            "thread_id": str(query_thread_id),
+                            "telegram_dm_topic_reply_fallback": True,
+                        },
+                        reply_to_message_id=reply_to_id,
+                        reply_to_mode=self._reply_to_mode,
+                    )
+                )
+            else:
+                send_kwargs.update(
+                    self._thread_kwargs_for_send(
+                        str(query_chat_id),
+                        str(query_thread_id),
+                        {"thread_id": str(query_thread_id)},
+                        reply_to_mode=self._reply_to_mode,
+                    )
+                )
+
+        try:
+            await self._send_message_with_thread_fallback(**send_kwargs)
+        except Exception as exc:
+            logger.error(
+                "[%s] FNOS callback response delivery failed: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+            )
+        return
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -7189,6 +7272,41 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- FNOS sourcing-meeting answer buttons (fnx:s:<meeting_date>:<y|n>) ---
+        if data.startswith("fnx:s:"):
+            match = _FNOS_SOURCING_CALLBACK_RE.fullmatch(data)
+            if match is None:
+                await query.answer(text="잘못된 FNOS 자동화 요청입니다.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ 이 자동화 요청을 실행할 권한이 없습니다.")
+                return
+
+            await query.answer(text="응답을 저장하고 있습니다…")
+            answer = "yes" if match.group("answer") == "y" else "no"
+            try:
+                response_text = await asyncio.to_thread(
+                    _request_fnos_sourcing_answer,
+                    match.group("meeting_date"),
+                    answer,
+                    query_user_name,
+                )
+            except Exception as exc:
+                safe_error = _redact_telegram_error_text(exc) or type(exc).__name__
+                response_text = f"요청 처리 실패: {safe_error}"
+            await self._reply_fnos_callback(
+                query_message, query_chat_id, query_chat_type, query_thread_id, response_text
+            )
+            return
 
         # --- FNOS cron-failure callbacks (fnx:action:job_id:run_ref) ---
         if data.startswith("fnx:"):
@@ -7273,57 +7391,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     safe_error = _redact_telegram_error_text(exc) or type(exc).__name__
                     response_text = f"요청 처리 실패: {safe_error}"
 
-            if query_chat_id is None:
-                logger.warning("[%s] FNOS callback has no chat id", self.name)
-                return
-
-            send_kwargs: Dict[str, Any] = {
-                "chat_id": normalize_telegram_chat_id(query_chat_id),
-                "text": response_text,
-                "parse_mode": None,
-                **self._link_preview_kwargs(),
-            }
-            if query_thread_id is not None:
-                chat_type_value = getattr(query_chat_type, "value", query_chat_type)
-                is_private_chat = str(chat_type_value).lower() in {
-                    "private",
-                    str(ChatType.PRIVATE).lower(),
-                    str(getattr(ChatType.PRIVATE, "value", ChatType.PRIVATE)).lower(),
-                }
-                prompt_message_id = getattr(query_message, "message_id", None)
-                if is_private_chat and prompt_message_id is not None:
-                    reply_to_id = int(prompt_message_id)
-                    send_kwargs["reply_to_message_id"] = reply_to_id
-                    send_kwargs.update(
-                        self._thread_kwargs_for_send(
-                            str(query_chat_id),
-                            str(query_thread_id),
-                            {
-                                "thread_id": str(query_thread_id),
-                                "telegram_dm_topic_reply_fallback": True,
-                            },
-                            reply_to_message_id=reply_to_id,
-                            reply_to_mode=self._reply_to_mode,
-                        )
-                    )
-                else:
-                    send_kwargs.update(
-                        self._thread_kwargs_for_send(
-                            str(query_chat_id),
-                            str(query_thread_id),
-                            {"thread_id": str(query_thread_id)},
-                            reply_to_mode=self._reply_to_mode,
-                        )
-                    )
-
-            try:
-                await self._send_message_with_thread_fallback(**send_kwargs)
-            except Exception as exc:
-                logger.error(
-                    "[%s] FNOS callback response delivery failed: %s",
-                    self.name,
-                    _redact_telegram_error_text(exc),
-                )
+            await self._reply_fnos_callback(
+                query_message, query_chat_id, query_chat_type, query_thread_id, response_text
+            )
             return
 
         # --- Model picker callbacks ---
