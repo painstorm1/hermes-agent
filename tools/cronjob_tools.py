@@ -50,6 +50,7 @@ from cron.jobs import (
     remove_job,
     resolve_job_ref,
     resume_job,
+    trigger_job,
     update_job,
 )
 
@@ -1399,6 +1400,61 @@ def cronjob(
                 scan_error = _scan_cron_prompt(extra_prompt)
                 if scan_error:
                     return tool_error(scan_error, success=False)
+            # A finite agent session (for example ``hermes chat -q`` used by
+            # an automation broker) cannot own a minutes-to-hours cron run:
+            # its process exits with the request and tears the nested job down.
+            # Queue the fire durably for the gateway ticker instead. Direct
+            # Python/``hermes cron run`` callers have no session_id and retain
+            # their existing synchronous fallback for installations without a
+            # gateway.
+            try:
+                from gateway.session_context import async_delivery_supported
+
+                finite_session = bool(session_id) and not async_delivery_supported()
+            except Exception:
+                finite_session = False
+            if finite_session:
+                if extra_prompt:
+                    return tool_error(
+                        "A finite session cannot run cron inline or preserve a "
+                        "transient run prompt. Omit prompt to schedule the job "
+                        "on the next gateway scheduler tick.",
+                        success=False,
+                    )
+                if not is_job_runnable(job):
+                    return tool_error(
+                        "Job is paused/disabled; resume it before running.",
+                        success=False,
+                    )
+                scheduled = trigger_job(job_id, require_runnable=True)
+                if not scheduled:
+                    refreshed = get_job(job_id)
+                    if refreshed is not None and not is_job_runnable(refreshed):
+                        return tool_error(
+                            "Job is paused/disabled; resume it before running.",
+                            success=False,
+                        )
+                    return tool_error(
+                        "Job no longer exists; nothing to schedule.",
+                        success=False,
+                    )
+                _notify_provider_jobs_changed_safe()
+                result = _format_job(scheduled)
+                result["executed"] = False
+                result["scheduled"] = True
+                result["execution_mode"] = "scheduler"
+                return json.dumps(
+                    {
+                        "success": True,
+                        "job": result,
+                        "note": (
+                            "The job was scheduled for the next gateway "
+                            "scheduler tick; it was not executed in this "
+                            "finite caller process."
+                        ),
+                    },
+                    indent=2,
+                )
             # Execute the job immediately rather than only scheduling it for the
             # next scheduler tick — a manual `run` should actually run, even when
             # no gateway/ticker is active (the #41037 case). The claim (taken
@@ -1619,7 +1675,7 @@ Use action='create' to schedule a new job from a prompt or one or more skills.
 Use action='list' to inspect jobs.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
 
-action='run' fires the job immediately in the BACKGROUND (like delegate_task): the call returns at once with a handle and the job's outcome re-enters the conversation as a new message when it finishes. Do not wait or poll after triggering a run — just continue. Optionally pass 'prompt' with action='run' to inject transient per-run context (appended to the job's stored prompt for that single fire only, never persisted).
+action='run' fires the job immediately in the BACKGROUND (like delegate_task): the call returns at once with a handle and the job's outcome re-enters the conversation as a new message when it finishes. Finite/stateless agent sessions enqueue the job for the next gateway scheduler tick instead of running it inline. Do not wait or poll after triggering a run — just continue. Optionally pass 'prompt' with action='run' to inject transient per-run context (appended to the job's stored prompt for that single fire only, never persisted); finite sessions must omit it because scheduler enqueue cannot preserve transient context.
 
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
 

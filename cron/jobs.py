@@ -2234,21 +2234,27 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
-def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Schedule a job to run on the next scheduler tick. Accepts a job ID or name."""
-    job = resolve_job_ref(job_id)
-    if not job:
-        return None
-    return update_job(
-        job["id"],
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
-        },
-    )
+def trigger_job(
+    job_id: str, *, require_runnable: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Schedule a job for the next tick, optionally without reviving a pause."""
+    # Keep the current-state check and next_run_at write under one cross-process
+    # lock. Otherwise a concurrent pause can land between resolve_job_ref() and
+    # update_job(), then be overwritten by this trigger (TOCTOU).
+    with _jobs_lock():
+        job = resolve_job_ref(job_id)
+        if not job or (require_runnable and not is_job_runnable(job)):
+            return None
+        return update_job(
+            job["id"],
+            {
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "next_run_at": _hermes_now().isoformat(),
+            },
+        )
 
 
 def remove_job(job_id: str) -> bool:

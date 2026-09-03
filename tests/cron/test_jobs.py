@@ -418,6 +418,19 @@ class TestResolveJobRef:
         with pytest.raises(AmbiguousJobReference):
             remove_job("dup")
 
+    def test_trigger_require_runnable_does_not_revive_paused_job(self, tmp_cron_dir):
+        """Automation enqueue preserves an operator pause at the write boundary."""
+        from cron.jobs import trigger_job
+
+        job = create_job(prompt="paused", schedule="1h", name="paused-trigger")
+        pause_job(job["id"], reason="operator pause")
+
+        assert trigger_job(job["id"], require_runnable=True) is None
+        stored = get_job(job["id"])
+        assert stored["enabled"] is False
+        assert stored["state"] == "paused"
+        assert stored["paused_reason"] == "operator pause"
+
 
 class TestMarkJobRun:
     def test_increments_completed(self, tmp_cron_dir):

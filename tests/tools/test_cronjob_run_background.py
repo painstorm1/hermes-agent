@@ -306,3 +306,29 @@ class TestCronjobRunToolIntegration:
         assert out["job"]["execution_success"] is True
         m_claim.assert_called_once_with("job-bg-13", return_job=True)
         m_run.assert_called_once()
+
+    def test_stateless_agent_session_enqueues_on_gateway_tick(self):
+        """A one-shot agent process must not own the nested cron execution."""
+        scheduled = {
+            **_job("job-bg-14"),
+            "enabled": True,
+            "state": "scheduled",
+            "next_run_at": "2026-09-02T22:00:00+09:00",
+        }
+        with patch("tools.cronjob_tools.resolve_job_ref", return_value=_job("job-bg-14")), \
+             patch("gateway.session_context.async_delivery_supported", return_value=False), \
+             patch("tools.cronjob_tools.trigger_job", return_value=scheduled) as m_trigger, \
+             patch("tools.cronjob_tools._try_dispatch_background_run") as m_background, \
+             patch("tools.cronjob_tools._execute_job_now") as m_inline:
+            out = json.loads(
+                cronjob(action="run", job_id="job-bg-14", session_id="cli-session")
+            )
+
+        assert out["success"] is True
+        assert out["job"]["scheduled"] is True
+        assert out["job"]["executed"] is False
+        assert out["job"]["execution_mode"] == "scheduler"
+        assert out["job"]["next_run_at"] == "2026-09-02T22:00:00+09:00"
+        m_trigger.assert_called_once_with("job-bg-14", require_runnable=True)
+        m_background.assert_not_called()
+        m_inline.assert_not_called()
