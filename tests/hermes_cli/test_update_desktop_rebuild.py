@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_cli import main as cli_main
+from hermes_cli import main_desktop as cli_main
 from hermes_cli import update_cmd
 
 

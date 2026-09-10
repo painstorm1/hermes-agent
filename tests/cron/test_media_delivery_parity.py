@@ -29,8 +29,10 @@ import os
 from pathlib import Path
 
 import pytest
+import yaml
 
-from cron.scheduler import _deliver_result, _send_media_via_adapter
+from cron.scheduler import _deliver_result
+from cron.scheduler_delivery import _send_media_via_adapter
 
 
 @pytest.fixture()
@@ -229,10 +231,10 @@ class TestMediaPolicyEnvBridge:
         allow_dir = tmp_path / "reports"
         allow_dir.mkdir()
         (home / "config.yaml").write_text(
-            "gateway:\n"
-            "  strict: true\n"
-            f"  media_delivery_allow_dirs: [{str(allow_dir)!r}]\n"
-            "  trust_recent_files: false\n"
+            yaml.safe_dump({"gateway": {
+                "strict": True, "media_delivery_allow_dirs": [str(allow_dir)],
+                "trust_recent_files": False,
+            }})
         )
         monkeypatch.setenv("HERMES_HOME", str(home))
         for var in (
@@ -264,9 +266,9 @@ class TestMediaPolicyEnvBridge:
         old = 1_600_000_000
         os.utime(media, (old, old))
         (home / "config.yaml").write_text(
-            "gateway:\n"
-            "  strict: true\n"
-            f"  media_delivery_allow_dirs: [{str(allow_dir)!r}]\n"
+            yaml.safe_dump({"gateway": {
+                "strict": True, "media_delivery_allow_dirs": [str(allow_dir)],
+            }})
         )
         monkeypatch.setenv("HERMES_HOME", str(home))
         for var in ("HERMES_MEDIA_DELIVERY_STRICT", "HERMES_MEDIA_ALLOW_DIRS"):

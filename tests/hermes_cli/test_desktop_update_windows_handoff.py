@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import sys
 import venv
+import struct
+import sysconfig
 from pathlib import Path
 
 import pytest
@@ -24,7 +26,7 @@ def test_windows_handoff_runs_update_without_locking_shim_and_validates_relaunch
     tmp_path: Path,
 ) -> None:
     """The update runs through venv Python, then validates the new Desktop app."""
-    completed, calls, relaunch, _result = run_windows_handoff(tmp_path)
+    completed, calls, relaunch, result = run_windows_handoff(tmp_path)
 
     assert completed.returncode == 0, completed.stderr
     assert calls[0]["argv"] == [
@@ -34,11 +36,15 @@ def test_windows_handoff_runs_update_without_locking_shim_and_validates_relaunch
         "--force",
         "--branch",
         "main",
+        "--keep-stash",
     ]
     assert calls[0]["shim_replaceable"] is True
     assert calls[0]["cwd"] == str(tmp_path / "hermes-agent")
     assert calls[1]["argv"] == ["desktop", "--build-only"]
     assert relaunch.exists()
+    assert result["ok"] is True
+    assert (tmp_path / "relaunched.txt").exists()
+    assert not (tmp_path / ".hermes-update-in-progress").exists()
 
 
 @pytest.mark.windows_only
@@ -50,7 +56,7 @@ def test_windows_handoff_reports_failure_after_validation_build_and_single_retry
 
     assert completed.returncode != 0
     assert [call["argv"] for call in calls] == [
-        ["update", "--yes", "--gateway", "--force", "--branch", "main"],
+        ["update", "--yes", "--gateway", "--force", "--branch", "main", "--keep-stash"],
         ["desktop", "--build-only"],
         ["desktop", "--force-build", "--build-only"],
     ]
@@ -69,7 +75,7 @@ def test_windows_handoff_retries_once_when_validation_build_does_not_create_rela
     assert completed.returncode == 6
     assert not relaunch.exists()
     assert [call["argv"] for call in calls] == [
-        ["update", "--yes", "--gateway", "--force", "--branch", "main"],
+        ["update", "--yes", "--gateway", "--force", "--branch", "main", "--keep-stash"],
         ["desktop", "--build-only"],
         ["desktop", "--force-build", "--build-only"],
     ]
@@ -94,7 +100,10 @@ def run_windows_handoff(
     fake_root = tmp_path / "fake"
     package_dir = fake_root / "hermes_cli"
     package_dir.mkdir(parents=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    repo = Path(__file__).parents[2]
+    # Fake only update/build commands; receipt verification imports real code.
+    (package_dir / "__init__.py").write_text(
+        f"__path__.append({str(repo / 'hermes_cli')!r})\n", encoding="utf-8")
     (package_dir / "main.py").write_text(
         '''import json
 import os
@@ -120,7 +129,10 @@ def main():
     if os.environ.get("HERMES_HANDOFF_SKIP_RELAUNCH") == "1":
         raise SystemExit(0)
     if sys.argv[1] == "desktop" and os.environ.get("HERMES_HANDOFF_BUILD_FAIL") != "1":
-        Path(os.environ["HERMES_HANDOFF_RELAUNCH"]).write_bytes(b"fake-pe")
+        import shutil
+        shutil.copy2(os.environ["HERMES_HANDOFF_TEMPLATE"], os.environ["HERMES_HANDOFF_RELAUNCH"])
+        from hermes_cli.main_desktop import _write_desktop_build_stamp
+        _write_desktop_build_stamp(Path.cwd(), source_mode=False)
     if sys.argv[1] == "desktop" and os.environ.get("HERMES_HANDOFF_BUILD_FAIL") == "1":
         raise SystemExit(1)
     raise SystemExit(0)
@@ -133,16 +145,40 @@ if __name__ == "__main__":
     )
 
     record = tmp_path / "calls.json"
-    relaunch = tmp_path / "Hermes.exe"
+    relaunch = install_root / "apps/desktop/release/win-unpacked/Hermes.exe"
+    resources = relaunch.parent / "resources"
+    dist = resources / "app.asar.unpacked/dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text('<script type="module" src="./assets/index.js"></script>', encoding="utf-8")
+    (dist / "assets/index.js").write_text("export {};", encoding="utf-8")
+    entry = b'import "electron";'
+    (dist / "electron-main.mjs").write_bytes(entry)
+    package = json.dumps({"main": "dist/electron-main.mjs"}).encode()
+    header = json.dumps({"files": {"package.json": {"size": len(package), "offset": "0"}, "dist": {"files": {
+        "electron-main.mjs": {"size": len(entry), "unpacked": True}}}}}).encode()
+    padded = header + b"\0" * (-len(header) % 4)
+    (resources / "app.asar").write_bytes(struct.pack("<4I", 4, 8 + len(padded), 4 + len(padded), len(header)) + padded + package)
+    (install_root / ".gitignore").write_text("apps/desktop/release/\n", encoding="utf-8")
+    template = tmp_path / "fixture.exe"
+    receipt = str(tmp_path / "relaunched.txt").replace('"', '""')
+    compile_result = subprocess.run([
+        "powershell.exe", "-NoProfile", "-Command",
+        "Add-Type -OutputType WindowsApplication -OutputAssembly '" + str(template).replace("'", "''") +
+        "' -TypeDefinition 'public class Fixture { public static void Main() { System.IO.File.WriteAllText(@\"" +
+        receipt + "\", \"fixture\"); System.Threading.Thread.Sleep(25000); } }'",
+    ], capture_output=True, text=True, timeout=30)
+    assert compile_result.returncode == 0, compile_result.stderr
     script = Path(__file__).parents[2] / "scripts" / "desktop-update" / "windows.ps1"
     env = os.environ.copy()
     env.update(
         {
-            "PYTHONPATH": str(fake_root),
+            "PYTHONPATH": os.pathsep.join([str(fake_root), str(repo), sysconfig.get_paths()["purelib"], env.get("PYTHONPATH", "")]),
+            "PSModuleAnalysisCachePath": str(tmp_path / "ModuleAnalysisCache"),
             "SystemDrive": env.get("SystemDrive", "C:"),
             "HERMES_HANDOFF_RECORD": str(record),
             "HERMES_HANDOFF_SHIM": str(shim),
             "HERMES_HANDOFF_RELAUNCH": str(relaunch),
+            "HERMES_HANDOFF_TEMPLATE": str(template),
         }
     )
     if build_fail:
@@ -170,6 +206,9 @@ if __name__ == "__main__":
         capture_output=True,
         text=True,
         env=env,
+        timeout=180,
+        encoding="utf-8",
+        errors="replace",
     )
     calls = json.loads(record.read_text(encoding="utf-8"))
     result = json.loads((tmp_path / ".hermes-update-result.json").read_text(encoding="utf-8"))

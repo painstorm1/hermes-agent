@@ -7,6 +7,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+pytestmark = pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not enforced on Windows")
 
 class TestCronFilePermissions(unittest.TestCase):
     """Verify cron files get secure permissions."""
