@@ -131,7 +131,7 @@ class TestRunningJobGuard:
         result = callback()
         future.set_result(result)
 
-        assert claim_calls == [("queued-job", {"return_job": True})]
+        assert claim_calls == [("queued-job", {"return_job": True, "expected_manual_run_at": None})]
         assert "queued-job" not in sched._running_job_ids
 
 
@@ -381,7 +381,7 @@ class TestTickBatchAdvance:
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
         monkeypatch.setattr(
             sched, "advance_next_runs",
-            lambda ids: advance_calls.append(list(ids)) or len(list(ids)))
+            lambda ids, **kw: advance_calls.append((list(ids), kw)) or len(list(ids)))
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -390,7 +390,9 @@ class TestTickBatchAdvance:
         n = sched.tick(verbose=False)
 
         assert n == 4
-        assert advance_calls == [["job-0", "job-1", "job-2", "job-3"]], (
+        assert advance_calls == [(["job-0", "job-1", "job-2", "job-3"], {
+            "expected_manual_runs": {job["id"]: None for job in jobs},
+            "dispatch_snapshots": {job["id"]: job for job in jobs}})], (
             f"tick must batch-advance the due set in ONE call; got {advance_calls}")
 
         sched._shutdown_parallel_pool()

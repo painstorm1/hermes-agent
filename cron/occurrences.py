@@ -1,8 +1,9 @@
 """Exact scheduled identities, independent of mutable jobs.json dispatch stamps."""
 from datetime import datetime, timezone
-import logging
 
-logger = logging.getLogger(__name__)
+
+class OccurrenceLookupError(RuntimeError):
+    """Completion is unknown; neither execution nor consuming the slot is safe."""
 
 
 def scheduled_instant(value):
@@ -19,18 +20,29 @@ def scheduled_instant(value):
 
 
 def completed_occurrence(job, instant):
-    """Unknown/failed/pruned attempts cannot prove completion: keep them eligible."""
-    from cron.executions import _transaction
+    """Return completion evidence, or raise when the ledger cannot establish it."""
+    from cron.executions import _transaction, execution_row_fingerprint
 
     instant = scheduled_instant(instant)
     if instant is None:
         return False
     try:
         with _transaction() as conn:
-            return conn.execute(
-                "SELECT 1 FROM executions WHERE job_id=? AND scheduled_instant=? "
-                "AND status='completed' LIMIT 1", (str(job['id']), instant)
-            ).fetchone() is not None
-    except Exception:
-        logger.warning("Cannot check completed occurrence for job %s", job['id'], exc_info=True)
-        return False
+            rows = conn.execute(
+                "SELECT * FROM executions WHERE job_id=? AND scheduled_instant=? "
+                "AND status='completed'", (str(job['id']), instant)
+            ).fetchall()
+            for row in rows:
+                annotation = conn.execute(
+                    "SELECT 1 FROM manual_occurrence_annotations "
+                    "WHERE execution_id=? AND job_id=? AND scheduled_instant=? AND row_fingerprint=? "
+                    "AND length(trim(manual_request_receipt_ref)) > 0 "
+                    "AND length(trim(reason)) > 0 AND length(trim(approval_ref)) > 0",
+                    (row['id'], row['job_id'], instant, execution_row_fingerprint(row)),
+                ).fetchone()
+                if annotation is None:
+                    return True
+            return False
+    except Exception as exc:
+        raise OccurrenceLookupError(
+            f"Cannot check completed occurrence for job {job['id']}: {exc}") from exc

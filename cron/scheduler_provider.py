@@ -13,6 +13,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+from cron.jobs import _MISSING
+
 logger = logging.getLogger(__name__)
 
 # Cap for exponential tick backoff during fd exhaustion (interval doubled per failure).
@@ -136,16 +138,22 @@ class CronScheduler(ABC):
 
     def fire_due(
         self, job_id: str, *, adapters: Any = None, loop: Any = None, force: bool = False,
+        occurrence: Any = _MISSING,
     ) -> bool:
         """Run one job NOW (inbound fire webhook entry). Store CAS claim (multi-machine
         at-most-once) then shared ``run_one_job``. True if THIS caller claimed and processed the
         attempt (even if the job failed); False if the claim was lost or the job is gone."""
-        claimed_job = self.claim_fire(job_id, force=force)
+        claim_kwargs = {"force": force}
+        if occurrence is not _MISSING:
+            claim_kwargs["occurrence"] = occurrence
+        claimed_job = self.claim_fire(job_id, **claim_kwargs)
         if claimed_job is None:
             return False
         return self.fire_claimed(claimed_job, adapters=adapters, loop=loop)
 
-    def claim_fire(self, job_id: str, *, force: bool = False) -> dict | None:
+    def claim_fire(
+        self, job_id: str, *, force: bool = False, occurrence: Any = _MISSING,
+    ) -> dict | None:
         """Durably claim one fire + create its audit attempt. Transports call this synchronously
         before acknowledging, then pass the exact snapshot to ``fire_claimed`` off-thread."""
         from cron.executions import create_execution, finish_execution, set_execution_occurrence
@@ -155,6 +163,8 @@ class CronScheduler(ABC):
         claim_kwargs = {"return_job": True}
         if force:
             claim_kwargs["force"] = True
+        if occurrence is not _MISSING:
+            claim_kwargs["occurrence"] = occurrence
         try:
             claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
             if isinstance(claimed_job, dict):
@@ -189,18 +199,31 @@ class CronScheduler(ABC):
 
 def provider_supports_force_fire(provider: Any) -> bool:
     """Return whether a provider can safely receive ``fire_due(force=...)`` (signature-detected)."""
+    return _accepts_fire_keyword(provider.fire_due, "force")
+
+
+def _accepts_fire_keyword(method: Any, keyword: str, *, explicit: bool = False) -> bool:
     try:
-        parameters = inspect.signature(provider.fire_due).parameters.values()
+        parameters = inspect.signature(method).parameters.values()
     except (TypeError, ValueError):
         return False
     return any(
-        p.kind is inspect.Parameter.VAR_KEYWORD
+        (not explicit and p.kind is inspect.Parameter.VAR_KEYWORD)
         or (
-            p.name == "force"
+            p.name == keyword
             and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
         )
         for p in parameters
     )
+
+
+def provider_supports_manual_occurrence(provider: Any) -> bool:
+    """Do not silently route a manual request through a legacy scheduled-only override."""
+    if not _accepts_fire_keyword(provider.fire_due, "occurrence", explicit=True):
+        return False
+    if getattr(type(provider), "fire_due", None) is CronScheduler.fire_due:
+        return _accepts_fire_keyword(provider.claim_fire, "occurrence", explicit=True)
+    return True
 
 
 def provider_supports_split_fire(provider: Any) -> bool:

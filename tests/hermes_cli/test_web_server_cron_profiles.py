@@ -61,7 +61,8 @@ def test_fire_cron_job_scopes_store_and_runtime_home_together(
     captured = {}
 
     class RecordingProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None):
+        def fire_due(self, job_id, *, adapters=None, loop=None, occurrence):
+            assert occurrence is None
             captured["job_id"] = job_id
             captured["runtime_home"] = scheduler._get_hermes_home()
             captured["jobs_file"] = cron_jobs._current_cron_store().jobs_file
@@ -538,7 +539,8 @@ async def test_trigger_cron_job_fires_only_selected_job_and_returns_refreshed_st
     fired = []
 
     class RecordingProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None, force=False):
+        def fire_due(self, job_id, *, adapters=None, loop=None, force=False, occurrence):
+            assert occurrence is None
             fired.append(
                 {
                     "job_id": job_id,
@@ -599,7 +601,8 @@ async def test_trigger_cron_job_reports_lost_claim_as_conflict(
     )
 
     class ClaimLostProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None, force=False):
+        def fire_due(self, job_id, *, adapters=None, loop=None, force=False, occurrence):
+            assert occurrence is None
             return False
 
     monkeypatch.setattr(
@@ -633,9 +636,10 @@ async def test_trigger_cron_job_forces_paused_job_atomically(
     observed = {}
 
     class ForceProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None, force=False):
+        def fire_due(self, job_id, *, adapters=None, loop=None, force=False, occurrence):
+            assert occurrence is None
             observed["force"] = force
-            assert cron_jobs.claim_job_for_fire(job_id, force=force) is True
+            assert cron_jobs.claim_job_for_fire(job_id, force=force, occurrence=occurrence) is True
             cron_jobs.mark_job_run(job_id, success=True)
             return True
 
@@ -715,7 +719,8 @@ async def test_trigger_cron_job_returns_refreshed_execution_failure(
     )
 
     class FailedProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None, force=False):
+        def fire_due(self, job_id, *, adapters=None, loop=None, force=False, occurrence):
+            assert occurrence is None
             cron_jobs.mark_job_run(job_id, success=False, error="expected failure")
             return False
 
@@ -750,7 +755,8 @@ async def test_trigger_cron_job_returns_completed_snapshot_for_retained_oneshot(
     )
 
     class SuccessfulProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None, force=False):
+        def fire_due(self, job_id, *, adapters=None, loop=None, force=False, occurrence):
+            assert occurrence is None
             cron_jobs.mark_job_run(job_id, success=True)
             return True
 

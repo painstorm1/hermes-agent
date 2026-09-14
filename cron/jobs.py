@@ -2442,7 +2442,7 @@ def clear_run_claim(job_id: str) -> bool:
     return _with_job(job_id, apply, False)
 
 
-def advance_next_runs(job_ids) -> int:
+def advance_next_runs(job_ids, *, expected_manual_runs=None, dispatch_snapshots=None) -> int:
     """Batch form of :func:`advance_next_run`: one load + at most one save for the whole due set;
     one-shot/unknown ids are skipped. Returns the count advanced. Persisted once at the end, so a
     crash mid-batch re-fires the whole set on restart rather than a prefix (sub-10ms window)."""
@@ -2460,10 +2460,18 @@ def advance_next_runs(job_ids) -> int:
                 or job.get("schedule", {}).get("kind") not in {"cron", "interval"}
             ):
                 continue
+            if (expected_manual_runs is not None
+                    and job.get("manual_run_at") != expected_manual_runs.get(job["id"])):
+                continue  # don't advance away a replacement manual request
+            snapshot = (dispatch_snapshots or {}).get(job["id"])
+            if snapshot is not None and job != snapshot.get("_dispatch_record"):
+                continue  # no receipt for a record changed since this due scan
             new_next = compute_next_run(job["schedule"], now)
             if new_next and new_next != job.get("next_run_at"):
                 job["next_run_at"] = new_next
                 advanced += 1
+            if snapshot is not None:
+                snapshot["_dispatch_record"] = copy.deepcopy(job)
         if advanced:
             save_jobs(jobs)
         return advanced
@@ -2475,6 +2483,33 @@ def advance_next_run(job_id: str) -> bool:
     One-shots are left unchanged so they can retry. Returns True if next_run_at was advanced."""
     # >= 1 (not == 1): duplicate ids in a corrupted file all advance; still report the advance.
     return advance_next_runs([job_id]) >= 1
+
+
+def restore_unstarted_occurrence(snapshot: Dict[str, Any]) -> bool:
+    """Undo a pre-dispatch advance ONLY after a known failure before fire acquisition.
+
+    The due scan/batch advance supply the exact persisted record as a CAS receipt. Any
+    intervening edit, request, claim or completion defeats it. No receipt survives a crash:
+    ambiguous attempts retain the existing at-most-once policy, never automatic replay.
+    """
+    expected = snapshot.get("_dispatch_record")
+    if (not expected or not snapshot.get("_scheduled_instant")
+            or expected.get("schedule", {}).get("kind") not in {"cron", "interval"}
+            or expected.get("fire_claim") or expected.get("run_claim")):
+        return False
+
+    def apply(jobs, _i, job):
+        if job != expected or job.get("next_run_at") == snapshot["next_run_at"]:
+            return False
+        job["next_run_at"] = snapshot["next_run_at"]
+        save_jobs(jobs)
+        return True
+
+    try:
+        return _under_fire_fence(snapshot["id"], lambda: _with_job(snapshot["id"], apply, False))
+    except Exception:
+        logger.exception("Could not restore unstarted occurrence for job %s", snapshot["id"])
+        return False
 
 
 def _machine_id() -> str:
@@ -2493,6 +2528,7 @@ def _machine_id() -> str:
 
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False, return_job: bool = False,
+    occurrence: Any = _MISSING, expected_manual_run_at: Any = _MISSING,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2501,7 +2537,21 @@ def claim_job_for_fire(
     stale callback cannot resurrect a paused job). Lose if a claim younger than
     ``claim_ttl_seconds`` exists (the TTL lets another fire reclaim after a crash; mark_job_run
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
-    ``next_run_at`` so a stale re-delivery cannot re-fire."""
+    ``next_run_at`` so a stale re-delivery cannot re-fire. ``occurrence`` omitted captures the
+    store identity under lock; None means manual, an aware ISO timestamp pins a due snapshot.
+    ``force`` only grants resume permission, never chooses the occurrence identity.
+    Due callers fence ``expected_manual_run_at`` independently of occurrence kind; explicit
+    None means the snapshot had no manual request, while omission disables that comparison."""
+    from cron.occurrences import completed_occurrence, scheduled_instant
+
+    if occurrence is not _MISSING and occurrence is not None:
+        occurrence = scheduled_instant(occurrence)
+        if occurrence is None:
+            raise ValueError("Cron occurrence must be an aware ISO timestamp or explicit None")
+    if (expected_manual_run_at is not _MISSING and expected_manual_run_at is not None
+            and scheduled_instant(expected_manual_run_at) is None):
+        raise ValueError("Due fire requires an aware manual request stamp or explicit None")
+
     def apply(jobs, _i, job):
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
@@ -2512,10 +2562,16 @@ def claim_job_for_fire(
         now = _hermes_now()
         if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
             return False  # someone holds a fresh claim
-        from cron.occurrences import completed_occurrence, scheduled_instant
-
-        manual = force or job.get("manual_run_at") == job.get("next_run_at")
-        instant = None if manual else scheduled_instant(job.get("next_run_at"))
+        if (expected_manual_run_at is not _MISSING
+                and job.get("manual_run_at") != expected_manual_run_at):
+            return False  # cancelled or replaced while this snapshot waited for its worker
+        if occurrence is _MISSING:
+            manual = bool(job.get("manual_run_at")) and job["manual_run_at"] == job.get("next_run_at")
+            instant = None if manual else scheduled_instant(job.get("next_run_at"))
+            if not manual and job.get("next_run_at") is not None and instant is None:
+                return False  # ambiguous stored timestamps must not become manual executions
+        else:
+            instant = occurrence
         if instant and completed_occurrence(job, instant):
             if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
@@ -2936,6 +2992,8 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     manual_run = job.get("manual_run_at") == next_run
     from cron.occurrences import completed_occurrence, scheduled_instant
 
+    if not manual_run and scheduled_instant(next_run) is None:
+        return False
     if not manual_run and completed_occurrence(job, next_run):
         new_next = d.recompute_next() if recurring else None
         if new_next:
@@ -3019,6 +3077,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
 
     if scan.needs_save:
         save_jobs(raw_jobs, removed_ids=scan.removed or None)
+    for job in due:
+        # In-memory receipt includes scan-time catch-up advances as well as tick advances.
+        job["_dispatch_record"] = copy.deepcopy(scan.find(job["id"]))
     return due
 
 

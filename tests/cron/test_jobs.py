@@ -835,7 +835,7 @@ class TestAdvanceNextRun:
         job = create_job(prompt="Crash test", schedule="every 1h")
         # Force next_run_at to 5 minutes ago (job is due)
         jobs = load_jobs()
-        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=5)).isoformat()
+        jobs[0]["next_run_at"] = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
         save_jobs(jobs)
 
         # Job should be due before advance
@@ -859,7 +859,7 @@ class TestGetDueJobs:
         job = create_job(prompt="Due now", schedule="every 1h")
         # Force next_run_at to 10 minutes ago (within the 30-min grace for hourly)
         jobs = load_jobs()
-        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=10)).isoformat()
+        jobs[0]["next_run_at"] = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
         save_jobs(jobs)
 
         due = get_due_jobs()
@@ -875,7 +875,7 @@ class TestGetDueJobs:
         job = create_job(prompt="Stale", schedule="every 1h")
         # Force next_run_at to 35 minutes ago (beyond the 30-min grace for hourly)
         jobs = load_jobs()
-        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
+        jobs[0]["next_run_at"] = (datetime.now(timezone.utc) - timedelta(minutes=35)).isoformat()
         save_jobs(jobs)
 
         due = get_due_jobs()
@@ -906,7 +906,7 @@ class TestGetDueJobs:
         jobs = load_jobs()
         # Push the healthy job beyond its grace window so the fast-forward path
         # (one of the id-less-crash sites) runs.
-        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
+        jobs[0]["next_run_at"] = (datetime.now(timezone.utc) - timedelta(minutes=35)).isoformat()
         # A malformed record: no 'id' key, mirroring the real corruption.
         jobs.append({
             "name": "idless-job",

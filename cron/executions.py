@@ -79,6 +79,24 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS manual_occurrence_annotations (
+             execution_id TEXT PRIMARY KEY,
+             job_id TEXT NOT NULL,
+             scheduled_instant TEXT NOT NULL,
+             row_fingerprint TEXT NOT NULL,
+             manual_request_receipt_ref TEXT NOT NULL CHECK(length(trim(manual_request_receipt_ref)) > 0),
+             reason TEXT NOT NULL CHECK(length(trim(reason)) > 0),
+             approval_ref TEXT NOT NULL CHECK(length(trim(approval_ref)) > 0),
+             recorded_at TEXT NOT NULL
+           )"""
+    )
+    for operation in ("UPDATE", "DELETE"):
+        conn.execute(
+            f"CREATE TRIGGER IF NOT EXISTS manual_occurrence_no_{operation.lower()} "
+            f"BEFORE {operation} ON manual_occurrence_annotations "
+            "BEGIN SELECT RAISE(ABORT, 'Manual occurrence annotations are append-only'); END"
+        )
 
 
 @contextmanager
@@ -130,6 +148,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
+               AND id NOT IN (SELECT execution_id FROM manual_occurrence_annotations)
              ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
@@ -341,6 +360,63 @@ def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
             (str(execution_id),),
         ).fetchone()
     return dict(row) if row is not None else None
+
+
+def execution_row_fingerprint(record: Dict[str, Any]) -> str:
+    """Fence every original SQLite field, not a mutable subset or a timing heuristic."""
+    import hashlib
+    import json
+
+    return hashlib.sha256(json.dumps(
+        dict(record), sort_keys=True, ensure_ascii=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def record_manual_occurrence_annotation(
+    *, execution_id: str, job_id: str, scheduled_instant: str, row_fingerprint: str,
+    manual_request_receipt_ref: str, reason: str, approval_ref: str,
+) -> Dict[str, Any]:
+    """Internal, operator-approved correction evidence; NEVER rewrite the original attempt.
+
+    The receipt reference must identify the reviewed manual request/response evidence. This is
+    not an inference API: callers must supply an exact pre-reviewed row fingerprint and approval.
+    """
+    from cron.occurrences import scheduled_instant as canonical_instant
+
+    evidence = dict(
+        execution_id=execution_id, job_id=job_id, scheduled_instant=scheduled_instant,
+        row_fingerprint=row_fingerprint, manual_request_receipt_ref=manual_request_receipt_ref,
+        reason=reason, approval_ref=approval_ref,
+    )
+    if any(not isinstance(value, str) or not value.strip() for value in evidence.values()):
+        raise ValueError("Exact execution, occurrence, fingerprint, receipt, reason and approval required")
+    instant = canonical_instant(scheduled_instant)
+    if instant is None:
+        raise ValueError("Annotation occurrence must be an aware ISO timestamp")
+    evidence["scheduled_instant"] = instant
+    with _transaction() as conn:
+        original = _fetch(conn, execution_id)
+        if (original is None or original["job_id"] != job_id
+                or original["scheduled_instant"] != instant or original["status"] != "completed"
+                or not original["finished_at"] or original["handoff_pending"]
+                or execution_row_fingerprint(original) != row_fingerprint):
+            raise ValueError("Manual occurrence evidence does not match the exact completed execution")
+        existing = conn.execute(
+            "SELECT * FROM manual_occurrence_annotations WHERE execution_id=?", (execution_id,),
+        ).fetchone()
+        if existing is not None:
+            if any(existing[key] != value for key, value in evidence.items()):
+                raise ValueError("Conflicting manual occurrence annotation")
+            return dict(existing)
+        evidence["recorded_at"] = _hermes_now().isoformat()
+        conn.execute(
+            "INSERT INTO manual_occurrence_annotations "
+            "(execution_id, job_id, scheduled_instant, row_fingerprint, "
+            "manual_request_receipt_ref, reason, approval_ref, recorded_at) "
+            "VALUES (:execution_id, :job_id, :scheduled_instant, :row_fingerprint, "
+            ":manual_request_receipt_ref, :reason, :approval_ref, :recorded_at)", evidence,
+        )
+    return evidence
 
 
 def latest_execution(job_id: str) -> Optional[Dict[str, Any]]:

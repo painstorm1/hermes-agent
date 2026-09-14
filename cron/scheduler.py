@@ -481,6 +481,7 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 
 from cron.jobs import (
     _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
+    restore_unstarted_occurrence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
     save_job_output, use_cron_store)
 from cron.executions import (
@@ -3640,8 +3641,21 @@ def _sweep_mcp_orphans() -> None:
 
 def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
+    from cron.occurrences import OccurrenceLookupError
+
     # Claim only when the worker actually starts, so a queued lease can't expire first.
-    claimed = claim_job_for_fire(job["id"], return_job=True)
+    claim_kwargs = {"return_job": True, "expected_manual_run_at": job.get("manual_run_at")}
+    if "_scheduled_instant" in job:
+        claim_kwargs["occurrence"] = job["_scheduled_instant"]
+    try:
+        claimed = claim_job_for_fire(job["id"], **claim_kwargs)
+    except OccurrenceLookupError as exc:
+        restore_unstarted_occurrence(job)
+        try:
+            finish_execution(job["execution_id"], success=False, error=str(exc))
+        except Exception:
+            logger.exception("Could not record blocked occurrence lookup: %s", exc)
+        raise
     if not claimed:
         finish_execution(
             job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
@@ -3649,7 +3663,6 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     # CAS returns the persisted record; bool fallback only for older test doubles.
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
-    claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
@@ -3711,6 +3724,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         # Release the claim so the next tick retries instead of wedging "already running".
         release_running_job(job_id)
         _clear_run_claim_best_effort()
+        restore_unstarted_occurrence(job)
         logger.exception(
             "Job '%s' not dispatched: execution creation failed: %s", job_label, execution_err)
         return None
@@ -3821,7 +3835,10 @@ def tick(
         # Advance next_run_at for recurring jobs FIRST, under the lock, before any execution
         # (at-most-once). Re-advancing running jobs keeps the grace window alive; mark_job_run
         # overwrites it on completion. Composes with the claim-time advance in claim_job_for_fire.
-        advance_next_runs([job["id"] for job in due_jobs])
+        advance_next_runs(
+            [job["id"] for job in due_jobs],
+            expected_manual_runs={job["id"]: job.get("manual_run_at") for job in due_jobs},
+            dispatch_snapshots={job["id"]: job for job in due_jobs})
 
         _max_workers = _resolve_max_parallel_workers()
         if verbose:
