@@ -753,7 +753,7 @@ def _row_belongs_to_claim(row: dict, claim_started: float) -> bool:
 
 
 def _record_stale_release(job: dict, job_id: str, age: float, allowance: float, fut, reason: str) -> None:
-    """WARNING log + probe record for one forced release, then ``last_error`` unless the ledger
+    """WARNING log + probe record for one forced release, then ``last_fire_error`` unless the ledger
     already holds the run's real outcome or the job has a finite repeat budget."""
     name = job.get("name") or job_id
     future_state = "pending" if fut is _FUTURE_PENDING else "missing" if fut is None else "finished"
@@ -778,8 +778,9 @@ def _record_stale_release(job: dict, job_id: str, age: float, allowance: float, 
             name, job_id)
         return
     try:
-        mark_job_run(
-            job_id, False,
+        from cron.jobs import note_fire_forward_failure
+        note_fire_forward_failure(
+            job_id,
             f"Stale in-flight claim force-released after {age / 60:.1f}m "
             f"(allowance {allowance / 60:.1f}m); previous run never released "
             f"the scheduler in-flight guard")
@@ -793,7 +794,8 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
     Stale = older than ``max(2 * interval, floor)`` AND (no live future — submit path hung before
     ``pool.submit`` returned — or finished without discarding the id) — or the claim's OWN ledger
     row is terminal regardless of age. Each release logs WARNING ``event=forced_release``, bumps
-    the probe counter, mirrors JSONL, and writes ``last_error``.
+    the probe counter and mirrors JSONL. Age releases write ``last_fire_error`` unless the job
+    has a finite repeat budget; ledger-terminal releases preserve the recorded outcome.
     """
     global _forced_release_count
 
@@ -3832,9 +3834,8 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for recurring jobs FIRST, under the lock, before any execution
-        # (at-most-once). Re-advancing running jobs keeps the grace window alive; mark_job_run
-        # overwrites it on completion. Composes with the claim-time advance in claim_job_for_fire.
+        # Advance scheduled recurring slots before dispatch (at-most-once). The shared helper
+        # fences manual requests/owners so an in-flight rejection cannot swallow their reservation.
         advance_next_runs(
             [job["id"] for job in due_jobs],
             expected_manual_runs={job["id"]: job.get("manual_run_at") for job in due_jobs},
