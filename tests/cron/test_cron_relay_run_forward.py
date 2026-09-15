@@ -223,9 +223,11 @@ class TestTriggerJobPromptStamp:
         )
         triggered = jobs_mod.trigger_job(job["id"], extra_prompt="just EU today")
         assert triggered["manual_run_prompt"] == "just EU today"
-        assert triggered["manual_run_at"] == triggered["next_run_at"]
+        assert triggered["next_run_at"] == job["next_run_at"]
+        assert triggered["manual_run_at"]
 
-        jobs_mod.mark_job_run(job["id"], success=True)
+        claim = jobs_mod.claim_job_for_fire(job["id"], return_job=True)
+        jobs_mod.mark_job_run(job["id"], success=True, expected_fire_owner=claim["fire_claim"]["by"])
         after = jobs_mod.get_job(job["id"])
         assert "manual_run_prompt" not in after
         assert "manual_run_at" not in after

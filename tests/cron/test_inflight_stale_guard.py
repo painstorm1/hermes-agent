@@ -22,7 +22,8 @@ fails. The implementation task (t_3778a491) makes them pass by adding the
 bounded stale-entry guard: on each tick, a claim older than
 ``max(2 * interval, floor)`` with no live future is force-released, logged
 with a countable ``cron.inflight.forced_release`` signal, and surfaced via
-``mark_job_run(..., success=False, error=...)`` as ``last_error``.
+``note_fire_forward_failure`` as ``last_fire_error`` for non-finite jobs.
+An unowned stale release must never complete a run or consume its reservation.
 
 Design notes
 ------------
@@ -119,7 +120,7 @@ class TestStaleInflightLeak:
         self, tmp_path, caplog
     ):
         """The regression: a leaked in-flight claim must be force-released by
-        the next tick, surface as ``last_error``, and emit a countable
+        the next tick, surface as ``last_fire_error``, and emit a countable
         signal — instead of silently skipping every fire until the gateway
         process restarts."""
         job = _job(job_id="board-pm-triage-wedged", minutes=60)
@@ -130,6 +131,8 @@ class TestStaleInflightLeak:
              patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
              patch("cron.jobs.load_jobs", return_value=[job]), \
              patch.object(sched, "get_due_jobs", return_value=[]), \
+             patch.object(sched.time, "time", return_value=sched._running_since[job_id] + 6 * 60 * 60), \
+             patch("cron.jobs.note_fire_forward_failure") as diagnostic, \
              patch.object(sched, "mark_job_run") as mark:
             sched.tick(verbose=False)
 
@@ -138,13 +141,14 @@ class TestStaleInflightLeak:
         # in the set forever, so this assertion FAILS and proves the leak.
         assert job_id not in sched.get_running_job_ids()
 
-        # GREEN (after the bounded guard): the release surfaces as a failure
-        # on the job row instead of silence…
-        assert mark.call_count == 1
-        args = mark.call_args.args
-        assert args[0] == job_id
-        assert args[1] is False
-        assert "in-flight" in args[2]
+        # An unowned release is diagnostic, not a completed run.
+        diagnostic.assert_called_once_with(
+            job_id,
+            "Stale in-flight claim force-released after 360.0m "
+            "(allowance 120.0m); previous run never released "
+            "the scheduler in-flight guard",
+        )
+        mark.assert_not_called()
 
         # …and emits the countable forced-release signal (log + probe stats).
         assert any(
@@ -264,16 +268,70 @@ class TestStaleInflightSweep:
 
     def test_pending_sentinel_released_when_submit_hung(self, tmp_path):
         """A claim whose submit path hung stays _FUTURE_PENDING past its
-        allowance (the SessionDB-init wedge class) and must be released."""
+        allowance and must be released with a diagnostic, not a run outcome."""
         job = _job()
+        now = time.time()
         sched._running_job_ids.add(job["id"])
-        sched._running_since[job["id"]] = time.time() - 5 * 60 * 60
+        sched._running_since[job["id"]] = now - 5 * 60 * 60
         sched._running_futures[job["id"]] = sched._FUTURE_PENDING
 
         with patch.object(sched, "mark_job_run") as mark, \
+             patch("cron.jobs.note_fire_forward_failure") as diagnostic, \
+             patch.object(sched.time, "time", return_value=now), \
              patch.object(sched, "_get_hermes_home", return_value=tmp_path):
             assert sched.sweep_stale_inflight([job]) == [job["id"]]
-        assert mark.call_count == 1
+        assert job["id"] not in sched.get_running_job_ids()
+        diagnostic.assert_called_once_with(
+            job["id"],
+            "Stale in-flight claim force-released after 300.0m "
+            "(allowance 120.0m); previous run never released "
+            "the scheduler in-flight guard",
+        )
+        mark.assert_not_called()
+
+    @pytest.mark.parametrize("repeat", [None, 2])
+    def test_unowned_release_preserves_real_owner_and_reservation(
+        self, tmp_path, monkeypatch, repeat
+    ):
+        """A stale local guard cannot complete a real owner or eat queued context."""
+        from cron import jobs
+
+        now = datetime.now(timezone.utc)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+        monkeypatch.setattr(sched.time, "time", lambda: now.timestamp())
+        monkeypatch.setattr(sched, "_get_hermes_home", lambda: tmp_path)
+        with jobs.use_cron_store(tmp_path):
+            job = jobs.create_job(prompt="fixture", schedule="every 1h", repeat=repeat)
+            job_id = job["id"]
+            jobs.update_job(job_id, {"repeat": {"times": repeat, "completed": 1}})
+            claimed = jobs.claim_job_for_fire(job_id, occurrence=None, return_job=True)
+            assert claimed and claimed["fire_claim"]["by"]
+            queued = jobs.trigger_job(job_id, extra_prompt="newer pending context")
+            before = jobs.get_job(job_id)
+            assert before["manual_run_at"] == queued["manual_run_at"]
+            assert before["manual_run_prompt"] == "newer pending context"
+            _inject_stale_claim(job_id)
+            with patch.object(sched, "mark_job_run") as mark, \
+                 patch.object(jobs, "note_fire_forward_failure", wraps=jobs.note_fire_forward_failure) as diagnostic:
+                assert sched.sweep_stale_inflight([before]) == [job_id]
+            after = jobs.get_job(job_id)
+            detail = (
+                "Stale in-flight claim force-released after 360.0m "
+                "(allowance 120.0m); previous run never released "
+                "the scheduler in-flight guard"
+            )
+            if repeat is None:
+                diagnostic.assert_called_once_with(job_id, detail)
+                assert after.pop("last_fire_error") == {"at": now.isoformat(), "detail": detail}
+            else:
+                diagnostic.assert_not_called()
+            assert after == before  # Includes next_run_at, repeat, enabled, owner and context.
+            assert after["fire_claim"] == claimed["fire_claim"]
+            mark.assert_not_called()
+            assert job_id not in sched.get_running_job_ids()
+            assert sched.get_inflight_guard_stats()["forced_releases"] == 1
+            assert jobs.claim_job_for_fire(job_id) is False
 
     def test_pending_sentinel_young_claim_is_not_released(self, tmp_path):
         """A young pending claim (submit still in flight) is safe."""

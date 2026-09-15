@@ -361,7 +361,13 @@ the time they were claimed. If an old `jobs.json` snapshot re-arms an occurrence
 that the retained ledger records as completed, Hermes skips that replay and
 re-anchors recurring jobs. This works even when the snapshot predates the
 dispatch stamp or the original run started late. Explicit manual runs do not
-consume a scheduled occurrence's identity.
+consume a scheduled occurrence's identity. For recurring cron and interval jobs,
+manual runs also leave the regular reservation and scheduled repeat budget
+unchanged, whether they succeed or fail. Queuing a manual run uses a separate
+wake-up time. If a manual run spans the regular due time, Hermes keeps that slot
+pending and runs it once after the manual owner releases the job (normal catch-up,
+not overlapping runs or a backlog burst). One-shot dispatch limits and pause gates
+still apply. A direct run is rejected while a separate manual request is queued.
 
 This is not an exactly-once side-effect guarantee: legacy rows without an
 identity, pruned history, unavailable ledgers, and interrupted attempts cannot

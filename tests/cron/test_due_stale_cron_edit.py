@@ -89,9 +89,12 @@ def test_manual_trigger_bypasses_stale_schedule_guard(temp_home, monkeypatch):
 
     assert triggered is not None
     assert job["id"] in [candidate["id"] for candidate in due]
-    assert triggered["manual_run_at"] == triggered["next_run_at"]
+    assert triggered["next_run_at"] == job["next_run_at"]
+    assert triggered["manual_run_at"] == now.isoformat()
 
-    mark_job_run(job["id"], success=True)
+    from cron.jobs import claim_job_for_fire
+    claim = claim_job_for_fire(job["id"], return_job=True)
+    mark_job_run(job["id"], success=True, expected_fire_owner=claim["fire_claim"]["by"])
 
     assert "manual_run_at" not in get_job(job["id"])
 

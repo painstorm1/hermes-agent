@@ -191,19 +191,21 @@ def _claim_for_manual_run(job_id: str, log_label: str):
             reason = "Job no longer exists; nothing to run."
         elif not is_job_runnable(refreshed):
             reason = "Job is paused/disabled; resume it before running."
+        elif refreshed.get("manual_run_at"):
+            reason = "A manual request is already queued; not started again."
         else:
             reason = "Job is already being fired by the scheduler; not run again."
         return None, {"claimed": False, "success": False, "error": reason}
     except Exception as e:
         logger.error("Failed to claim cron job %s for %s: %s", job_id, log_label, e)
-        with contextlib.suppress(Exception):
-            mark_job_run(job_id, False, str(e))
-        return None, {"claimed": True, "success": False, "error": str(e)}
+        # A save may have committed before raising. No owner receipt means no cleanup or retry.
+        return None, {"claimed": False, "success": False, "admission": "unknown",
+                      "retry_safe": False, "error": str(e)}
 
 
 def _execute_job_now(job: Dict[str, Any], extra_prompt: Optional[str] = None) -> Dict[str, Any]:
     """Run a job now, outside the scheduler tick: claim via ``claim_job_for_fire`` (the ticker's
-    CAS, so a concurrent tick cannot double-fire and next_run_at advances), then fire through
+    CAS, so a concurrent tick cannot double-fire), then fire through
     the shared ``run_one_job`` body. Returns {"claimed", "success", "error"}."""
     claimed_job, err = _claim_for_manual_run(job["id"], "immediate run")
     return err if err is not None else _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
@@ -267,7 +269,8 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
     to a worker). Returns {"claimed": True, "success": bool, "error": ...}."""
     job_id = job["id"]
     _registered = False
-    fire_owner = None
+    claim = job.get("fire_claim")
+    fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
     try:
         from cron.scheduler import release_running_job, run_one_job, try_register_running_job
 
@@ -331,8 +334,9 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
             # could erase a ticker-owned entry.
             with contextlib.suppress(Exception):
                 release_running_job(job_id)
-        with contextlib.suppress(Exception):
-            mark_job_run(job_id, False, str(e), expected_fire_owner=fire_owner)
+        if fire_owner:
+            with contextlib.suppress(Exception):
+                mark_job_run(job_id, False, str(e), expected_fire_owner=fire_owner)
         return {"claimed": True, "success": False, "error": str(e)}
 
 
@@ -717,15 +721,17 @@ def _action_run(job: Dict[str, Any], a: Dict[str, Any]) -> str:
         if forwarded is not None:
             return forwarded
         exec_result = _execute_job_now(job, extra_prompt=extra_prompt)
-    # A claimed direct run advances next_run_at and may race an external provider's
-    # one-shot for the same occurrence; a lost consumed fire cannot re-arm itself, so
-    # reconcile after the run has persisted its final state.
+    # Reconcile external wake-ups after the run persists its outcome; recurring manual
+    # completion leaves the regular reservation untouched.
     claimed = exec_result.get("claimed", False)
     if claimed:
         _notify_provider_jobs_changed_safe()
     result = _refreshed_job_view(job_id)
     result["executed"] = claimed
     result["execution_success"] = exec_result.get("success", False)
+    if exec_result.get("admission") == "unknown":
+        return _dumps({"success": False, "job": result, "admission": "unknown",
+                       "retry_safe": False, "error": exec_result.get("error")})
     if not claimed:
         result["execution_skipped"] = exec_result.get("error") or (
             "Already being fired by the scheduler; not run again.")
