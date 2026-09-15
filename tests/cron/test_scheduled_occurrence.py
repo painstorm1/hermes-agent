@@ -268,10 +268,7 @@ def test_tick_claim_uses_identity_captured_before_advance(occurrence_store, monk
 
     def claim(jid, **kwargs):
         claims.append(kwargs)
-        if mode == 'scheduled':
-            assert jobs.get_job(jid)['next_run_at'] != snapshot['next_run_at']
-        else:
-            assert jobs.get_job(jid)['next_run_at'] == snapshot['next_run_at']
+        assert jobs.get_job(jid)['next_run_at'] != snapshot['next_run_at']
         return original_claim(jid, **kwargs)
 
     monkeypatch.setattr(scheduler, 'claim_job_for_fire', claim)
@@ -420,16 +417,13 @@ def test_retrigger_before_tick_advance_keeps_new_request_due(occurrence_store, m
     scheduler.tick(verbose=False, sync=True)
     assert not ran
     persisted = jobs.get_job(job['id'])
-    assert persisted['next_run_at'] == replacement['next_run_at']
-    assert persisted['manual_run_at'] == replacement['manual_run_at']
+    assert persisted['next_run_at'] == persisted['manual_run_at'] == replacement['manual_run_at']
     assert persisted['manual_run_prompt'] == 'new manual request'
     monkeypatch.setattr(scheduler, 'get_due_jobs', jobs.get_due_jobs)
     assert scheduler.tick(verbose=False, sync=True) == 1
     assert len(ran) == 1 and ran[0]['_scheduled_instant'] is None
     assert ran[0]['manual_run_prompt'] == 'new manual request'
     assert executions.latest_execution(job['id'])['scheduled_instant'] is None
-    # A previously due regular slot is still owed after the manual request finishes.
-    assert scheduler.tick(verbose=False, sync=True) == (1 if original == 'scheduled' else 0)
     assert scheduler.tick(verbose=False, sync=True) == 0
 
 

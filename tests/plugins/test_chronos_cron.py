@@ -52,29 +52,6 @@ def chronos(monkeypatch):
     return prov, fake
 
 
-def test_queued_manual_rearm_preserves_recurring_reservation(temp_home, chronos, monkeypatch):
-    from datetime import datetime
-    from cron import jobs, executions, scheduler
-    prov, fake = chronos
-    monkeypatch.setattr(jobs, '_hermes_now', lambda: datetime.fromisoformat('2026-02-03T09:00:00+09:00'))
-    monkeypatch.setattr(executions, 'EXECUTIONS_FILE', temp_home / 'executions.db')
-    monkeypatch.setattr(scheduler, '_launch_external_cron_worker', lambda job: False)
-    monkeypatch.setattr(scheduler, 'run_job', lambda job, **kw: (True, 'fixture', 'fixture', None))
-    monkeypatch.setattr(scheduler, '_deliver_result', lambda *a, **kw: None)
-    with jobs.use_cron_store(temp_home / 'cron'):
-        job = jobs.create_job(prompt='fixture', schedule='every 1h', repeat=2, deliver='local')
-        original = job['next_run_at']
-        request = jobs.trigger_job(job['id'], extra_prompt='queued')
-        prov.reconcile()
-        assert fake.provisions[-1]['fire_at'] == request['manual_run_at']
-        assert jobs.get_job(job['id'])['next_run_at'] == original
-        assert prov.fire_due(job['id'])
-        assert executions.latest_execution(job['id'])['scheduled_instant'] is None
-        assert fake.provisions[-1]['fire_at'] == original
-        assert jobs.get_job(job['id'])['repeat']['completed'] == 0
-        assert jobs.get_job(job['id'])['next_run_at'] == original
-
-
 # -- is_available -------------------------------------------------------------
 
 def test_is_available_false_without_config(temp_home, monkeypatch):

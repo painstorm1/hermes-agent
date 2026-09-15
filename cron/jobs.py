@@ -2016,32 +2016,17 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None, *, require_runn
                 f"Cannot run: job '{name}' is {job.get('state')} (terminal). "
                 f"Create a new occurrence with 'hermes cron resume {name} "
                 "--run-now' or '--at <ISO-8601>'.")
-        requested_at = _hermes_now()
-        previous_request = _parse_aware(job.get("manual_run_at"))
-        if previous_request is not None and previous_request >= requested_at:
-            requested_at = previous_request + timedelta(microseconds=1)
-        manual_run_at = requested_at.isoformat()
+        manual_run_at = _hermes_now().isoformat()
         return update_job(job["id"], {
             "enabled": True,
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
-            "next_run_at": (job.get("next_run_at")
-                            if job.get("schedule", {}).get("kind") in {"cron", "interval"}
-                            else manual_run_at),
+            "next_run_at": manual_run_at,
             # Run-now intent, so cron expression/TZ repair guards don't treat it as stale state.
             "manual_run_at": manual_run_at,
             "manual_run_prompt": (extra_prompt or None),
         })
-
-
-def effective_run_at(job: Dict[str, Any]) -> Optional[str]:
-    """Pending manual wake-up, otherwise the untouched regular reservation."""
-    return job.get("manual_run_at") or job.get("next_run_at")
-
-
-def _manual_fire_claim(claim: Any) -> bool:
-    return isinstance(claim, dict) and "scheduled_instant" in claim and claim["scheduled_instant"] is None
 
 
 def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
@@ -2180,6 +2165,9 @@ def _record_run_outcome(
 ) -> None:
     """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
     job["last_run_at"] = now
+    job.pop("manual_run_at", None)
+    # The transient manual-run context is single-fire: the run that just completed consumed it.
+    job.pop("manual_run_prompt", None)
     delivery_failed = isinstance(delivery_error, str) and bool(delivery_error.strip())
     job["last_status"] = status or (
         "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
@@ -2267,24 +2255,16 @@ def mark_job_run(
     can't be taken, the job is missing, or ``expected_fire_owner`` no longer holds the fire claim.
     """
     def apply(jobs, _i, job):
-        claim = job.get("fire_claim")
         if expected_fire_owner is not None:
+            claim = job.get("fire_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_fire_owner:
                 logger.warning(
                     "mark_job_run: job_id %s fire claim owner changed; discarding stale completion",
                     job_id)
                 return False
-
-        manual_recurring = (_manual_fire_claim(claim)
-                            and claim.get("schedule_kind") in {"cron", "interval"})
-        consumed = claim.get("manual_run_at") if isinstance(claim, dict) else None
-        if consumed and consumed == job.get("manual_run_at"):
-            job.pop("manual_run_at", None)
-            job.pop("manual_run_prompt", None)
         now = _hermes_now().isoformat()
         _record_run_outcome(job, success, error, delivery_error, status, now)
-        if not manual_recurring:
-            _advance_after_run(job, now)
+        _advance_after_run(job, now)
         save_jobs(jobs)
         return True
 
@@ -2486,11 +2466,6 @@ def advance_next_runs(job_ids, *, expected_manual_runs=None, dispatch_snapshots=
             snapshot = (dispatch_snapshots or {}).get(job["id"])
             if snapshot is not None and job != snapshot.get("_dispatch_record"):
                 continue  # no receipt for a record changed since this due scan
-            if job.get("manual_run_at") or (
-                _manual_fire_claim(job.get("fire_claim"))
-                and _claim_is_live(job["fire_claim"], _hermes_now(), FIRE_CLAIM_TTL_SECONDS)
-            ):
-                continue  # neither queued nor running manual work consumes a regular slot
             new_next = compute_next_run(job["schedule"], now)
             if new_next and new_next != job.get("next_run_at"):
                 job["next_run_at"] = new_next
@@ -2562,7 +2537,7 @@ def claim_job_for_fire(
     stale callback cannot resurrect a paused job). Lose if a claim younger than
     ``claim_ttl_seconds`` exists (the TTL lets another fire reclaim after a crash; mark_job_run
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
-    ``next_run_at`` for scheduled (not manual) fires. ``occurrence`` omitted captures the
+    ``next_run_at`` so a stale re-delivery cannot re-fire. ``occurrence`` omitted captures the
     store identity under lock; None means manual, an aware ISO timestamp pins a due snapshot.
     ``force`` only grants resume permission, never chooses the occurrence identity.
     Due callers fence ``expected_manual_run_at`` independently of occurrence kind; explicit
@@ -2591,14 +2566,12 @@ def claim_job_for_fire(
                 and job.get("manual_run_at") != expected_manual_run_at):
             return False  # cancelled or replaced while this snapshot waited for its worker
         if occurrence is _MISSING:
-            manual = bool(job.get("manual_run_at"))
+            manual = bool(job.get("manual_run_at")) and job["manual_run_at"] == job.get("next_run_at")
             instant = None if manual else scheduled_instant(job.get("next_run_at"))
             if not manual and job.get("next_run_at") is not None and instant is None:
                 return False  # ambiguous stored timestamps must not become manual executions
         else:
             instant = occurrence
-            if job.get("manual_run_at") and expected_manual_run_at is _MISSING:
-                return False  # direct fire must not steal a separately queued request
         if instant and completed_occurrence(job, instant):
             if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
@@ -2610,13 +2583,8 @@ def claim_job_for_fire(
             _activate_job_record(job)
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
-        job["fire_claim"] = {
-            "at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}",
-            "scheduled_instant": instant,
-            "schedule_kind": job.get("schedule", {}).get("kind"),
-            "manual_run_at": job.get("manual_run_at") if instant is None else None,
-        }
-        if instant is not None and job.get("schedule", {}).get("kind") in {"cron", "interval"}:
+        job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
+        if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
             nxt = compute_next_run(job["schedule"], now.isoformat())
             if nxt:
                 job["next_run_at"] = nxt
@@ -3011,17 +2979,16 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     ):
         return False
 
-    if (_manual_fire_claim(job.get("fire_claim"))
-            and _claim_is_live(job["fire_claim"], now, FIRE_CLAIM_TTL_SECONDS)):
-        return False  # retain even an overdue regular slot while the manual owner runs
-    next_run = effective_run_at(job) or _recover_missing_next_run(job, scan)
+    next_run = job.get("next_run_at") or _recover_missing_next_run(job, scan)
     if not next_run:
         return False
     raw_next_run_dt = datetime.fromisoformat(next_run)
     d = _DueJob(job, scan, next_run, raw_next_run_dt, _ensure_aware(raw_next_run_dt))
     kind = d.kind
     recurring = kind in {"cron", "interval"}
-    # The independent manual wake-up has its own exact request identity.
+    # Intentionally string-exact on raw stored values: trigger_job stamps the SAME isoformat string
+    # into both fields, and any rewrite of next_run_at (edit, re-anchor, fire-claim advance) must
+    # invalidate the marker. Do not "fix" this with _ensure_aware normalization.
     manual_run = job.get("manual_run_at") == next_run
     from cron.occurrences import completed_occurrence, scheduled_instant
 
@@ -3034,8 +3001,7 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         return False
     if kind == "cron" and not manual_run and _repair_timezone_shifted_cron(d):
         return False
-    if not manual_run:
-        d.next_run_dt = _rearm_stale_error_recurring(d)
+    d.next_run_dt = _rearm_stale_error_recurring(d)
     if d.next_run_dt > now:
         return False
 

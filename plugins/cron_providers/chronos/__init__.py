@@ -14,7 +14,6 @@ import threading
 from typing import Any, Dict
 
 from cron.scheduler_provider import CronScheduler
-from cron.jobs import effective_run_at
 
 logger = logging.getLogger("cron.chronos")
 
@@ -85,7 +84,7 @@ class ChronosCronScheduler(CronScheduler):
         """Arm one one-shot at next_run_at (agent computes the time; NAS executes).
         dedup_key=(job_id, fire_at) makes re-arming the same fire a no-op."""
         job_id = job["id"]
-        fire_at = effective_run_at(job)
+        fire_at = job.get("next_run_at")
         if not fire_at:
             return
         self._get_client().provision(
@@ -128,8 +127,8 @@ class ChronosCronScheduler(CronScheduler):
         """Converge NAS one-shots toward jobs.json: arm missing/changed, cancel orphans."""
         from cron.jobs import get_job, load_jobs
         desired: Dict[str, str] = {
-            j["id"]: effective_run_at(j) for j in load_jobs()
-            if j.get("enabled") and effective_run_at(j) and j.get("state") != "paused"}
+            j["id"]: j["next_run_at"] for j in load_jobs()
+            if j.get("enabled") and j.get("next_run_at") and j.get("state") != "paused"}
         observed = self._list_armed()
         for job_id, fire_at in desired.items():
             if observed.get(job_id) != fire_at and (job := get_job(job_id)):
@@ -151,7 +150,7 @@ class ChronosCronScheduler(CronScheduler):
             from cron.jobs import get_job
             job_id = claimed_job["id"]
             job = get_job(job_id)
-            if job and job.get("enabled") and effective_run_at(job):
+            if job and job.get("enabled") and job.get("next_run_at"):
                 self._arm_logged(job, f"re-arm job {job_id} after fire")
         return ran
 

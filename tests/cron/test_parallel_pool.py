@@ -382,8 +382,6 @@ class TestTickBatchAdvance:
         monkeypatch.setattr(
             sched, "advance_next_runs",
             lambda ids, **kw: advance_calls.append((list(ids), kw)) or len(list(ids)))
-        # Synthetic jobs test batching, not persisted fire admission (as in the guard tests).
-        monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
