@@ -363,3 +363,59 @@ def test_public_tool_preserves_unknown_admission(recurring, monkeypatch, backgro
     assert result['retry_safe'] is False and result['job']['executed'] is False
     assert len(calls) == 1 and not ran
     assert jobs.get_job(job['id']) == before
+
+
+@pytest.mark.parametrize('mode', ['trigger', 'force'])
+def test_manual_run_of_paused_job_does_not_replay_stale_slot(recurring, mode):
+    """A slot skipped while paused is not a pending reservation: resuming via a manual run
+    re-anchors it like ``resume_job`` instead of replaying it right after the manual run."""
+    from cron.scheduler_provider import InProcessCronScheduler
+    jobs, executions, scheduler, job, ran, clock = recurring
+    jobs.update_job(job['id'], {'next_run_at': '2026-02-02T09:30:00+09:00'})
+    assert jobs.pause_job(job['id'])
+    if mode == 'trigger':
+        assert jobs.trigger_job(job['id'])
+        assert scheduler.tick(verbose=False, sync=True) == 1
+    else:
+        assert InProcessCronScheduler().fire_due(job['id'], force=True, occurrence=None)
+    assert len(ran) == 1 and ran[0]['_scheduled_instant'] is None
+    after = jobs.get_job(job['id'])
+    assert after['enabled'] and after['state'] == 'scheduled'
+    assert after['next_run_at'] == '2026-02-03T09:30:00+09:00'
+    assert after['repeat'] == {'times': 2, 'completed': 1}
+    assert scheduler.tick(verbose=False, sync=True) == 0
+    assert len(ran) == 1
+
+
+def test_repeated_manual_runs_today_leave_tomorrow_slot_intact(recurring, monkeypatch):
+    """Operator scenario: run tomorrow-09:30's job several times today (queued and direct, one
+    failing); tomorrow 09:30 still fires exactly once as the regular occurrence."""
+    from tools import cronjob_tools as tools
+    from cron.occurrences import scheduled_instant
+    jobs, executions, scheduler, job, ran, clock = recurring
+    jobs.update_job(job['id'], {'next_run_at': '2026-02-04T09:30:00+09:00',
+                                'repeat': {'times': None, 'completed': 5}})
+    before = reservation(jobs.get_job(job['id']))
+    outcomes = iter([True, False, True])
+    def run(claimed, **kw):
+        ran.append(claimed)
+        ok = next(outcomes, True)
+        return ok, 'fixture', 'fixture', None if ok else 'fixture failure'
+    monkeypatch.setattr(scheduler, 'run_job', run)
+    assert jobs.trigger_job(job['id'])
+    assert scheduler.tick(verbose=False, sync=True) == 1
+    clock[0] += timedelta(hours=1)
+    assert tools._execute_job_now(job)['success'] is False
+    clock[0] += timedelta(hours=1)
+    assert jobs.trigger_job(job['id'])
+    assert scheduler.tick(verbose=False, sync=True) == 1
+    assert reservation(jobs.get_job(job['id'])) == before
+    assert [r['_scheduled_instant'] for r in ran] == [None, None, None]
+    assert jobs.get_job(job['id']).get('manual_run_at') is None
+    clock[0] = datetime.fromisoformat('2026-02-04T09:30:30+09:00')
+    assert scheduler.tick(verbose=False, sync=True) == 1
+    assert ran[3]['_scheduled_instant'] == scheduled_instant('2026-02-04T09:30:00+09:00')
+    assert scheduler.tick(verbose=False, sync=True) == 0
+    after = jobs.get_job(job['id'])
+    assert after['next_run_at'] == '2026-02-05T09:30:00+09:00'
+    assert after['repeat'] == {'times': None, 'completed': 6}

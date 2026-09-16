@@ -2021,14 +2021,17 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None, *, require_runn
         if previous_request is not None and previous_request >= requested_at:
             requested_at = previous_request + timedelta(microseconds=1)
         manual_run_at = requested_at.isoformat()
+        recurring = job.get("schedule", {}).get("kind") in {"cron", "interval"}
+        next_run_at = job.get("next_run_at") if recurring else manual_run_at
+        if recurring and not is_job_runnable(job):
+            # Resuming: a slot skipped while paused is not pending, re-anchor like resume_job.
+            next_run_at = compute_next_run(job["schedule"], manual_run_at) or next_run_at
         return update_job(job["id"], {
             "enabled": True,
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
-            "next_run_at": (job.get("next_run_at")
-                            if job.get("schedule", {}).get("kind") in {"cron", "interval"}
-                            else manual_run_at),
+            "next_run_at": next_run_at,
             # Run-now intent, so cron expression/TZ repair guards don't treat it as stale state.
             "manual_run_at": manual_run_at,
             "manual_run_prompt": (extra_prompt or None),
@@ -2607,7 +2610,11 @@ def claim_job_for_fire(
                     save_jobs(jobs)
             return False
         if force:
+            resumed = not is_job_runnable(job)
             _activate_job_record(job)
+            if resumed and instant is None and job.get("schedule", {}).get("kind") in {"cron", "interval"}:
+                # Resuming via a manual fire: re-anchor the reservation like resume_job.
+                job["next_run_at"] = compute_next_run(job["schedule"], now.isoformat()) or job.get("next_run_at")
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
         job["fire_claim"] = {
